@@ -111,9 +111,10 @@ namespace Microsoft.ML
             int batchSize = 20,
             float learningRate = 0.01f)
         {
+
             var options = new Options()
             {
-                ModelLocation = arch == Architecture.ResnetV2101 ? @"resnet_v2_101_299.meta" : @"InceptionV3.meta",
+                ModelLocation = arch == Architecture.ResnetV2101 ? @"DnnImageModels\Resnet101V2Tensorflow\resnet_v2_101_299.meta" : "",
                 InputColumns = new[] { featuresColumnName },
                 OutputColumns = new[] { scoreColumnName, predictedLabelColumnName },
                 LabelColumn = labelColumnName,
@@ -156,6 +157,45 @@ namespace Microsoft.ML
                     }
                 }
             }
+
+            var env = CatalogUtils.GetEnvironment(catalog);
+            return new DnnEstimator(env, options, DnnUtils.LoadDnnModel(env, options.ModelLocation, true));
+        }
+
+        // OD Change
+        public static DnnEstimator ObjectDetection(
+            this ModelOperationsCatalog catalog,
+            string featuresColumnName,
+            string labelColumnName,
+            string outputGraphPath = null,
+            string scoreColumnName = "Score",
+            string predictedLabelColumnName = "PredictedLabel",
+            string checkpointName = "_retrain_checkpoint",
+            Architecture arch = Architecture.ResnetV2101,
+            DnnFramework dnnFramework = DnnFramework.Tensorflow,
+            int epoch = 10,
+            int batchSize = 20,
+            float learningRate = 0.01f)
+        {
+
+            var options = new Options()
+            {
+                ModelLocation = @"yolov3.meta", // OD Change
+                InputColumns = new[] { featuresColumnName },
+                OutputColumns = new[] { scoreColumnName, predictedLabelColumnName },
+                LabelColumn = labelColumnName,
+                TensorFlowLabel = labelColumnName,
+                Epoch = epoch,
+                LearningRate = learningRate,
+                BatchSize = batchSize,
+                AddBatchDimensionInputs = arch == Architecture.InceptionV3 ? false : true,
+                TransferLearning = true,
+                ScoreColumnName = scoreColumnName,
+                PredictedLabelColumnName = predictedLabelColumnName,
+                CheckpointName = checkpointName,
+                Arch = arch,
+                MeasureTrainAccuracy = false
+            };
 
             var env = CatalogUtils.GetEnvironment(catalog);
             return new DnnEstimator(env, options, DnnUtils.LoadDnnModel(env, options.ModelLocation, true));

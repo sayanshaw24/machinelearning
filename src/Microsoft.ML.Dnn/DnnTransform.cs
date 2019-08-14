@@ -3,6 +3,7 @@
 // See the LICENSE file in the project root for more information.
 
 using System;
+using System.Collections;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
@@ -18,6 +19,7 @@ using Microsoft.ML.Transforms;
 using Microsoft.ML.Transforms.Dnn;
 using NumSharp;
 using Tensorflow;
+using Tensorflow.Keras.Utils;
 using Tensorflow.Summaries;
 using static Microsoft.ML.Transforms.Dnn.DnnUtils;
 using static Microsoft.ML.Transforms.DnnEstimator;
@@ -721,6 +723,66 @@ namespace Microsoft.ML.Transforms
             });
         }
 
+        private (Operation, Tensor, Tensor, Tensor) AddObjectDetectionFinalRetrainOps(int classCount, string labelColumn,
+            string scoreColumnName, float learningRate, Tensor bottleneckTensor, bool isTraining)
+        {
+            var (batch_size, bottleneck_tensor_size) = (bottleneckTensor.TensorShape.Dimensions[0], bottleneckTensor.TensorShape.Dimensions[1]);
+            tf_with(tf.name_scope("input"), scope =>
+            {
+                _labelTensor = tf.placeholder(tf.int64, new TensorShape(batch_size), name: labelColumn);
+            });
+
+            string layerName = "final_retrain_ops";
+            Tensor logits = null;
+            tf_with(tf.name_scope(layerName), scope =>
+            {
+                RefVariable layerWeights = null;
+                tf_with(tf.name_scope("weights"), delegate
+                {
+                    var initialValue = tf.truncated_normal(new int[] { bottleneck_tensor_size, classCount }, stddev: 0.001f);
+                    layerWeights = tf.Variable(initialValue, name: "final_weights");
+                    VariableSummaries(layerWeights);
+                });
+
+                RefVariable layerBiases = null;
+                tf_with(tf.name_scope("biases"), delegate
+                {
+                    layerBiases = tf.Variable(tf.zeros(classCount), name: "final_biases");
+                    VariableSummaries(layerBiases);
+                });
+
+                tf_with(tf.name_scope("Wx_plus_b"), delegate
+                {
+                    var matmul = tf.matmul(bottleneckTensor, layerWeights);
+                    logits = matmul + layerBiases;
+                    tf.summary.histogram("pre_activations", logits);
+                });
+            });
+
+            _softMaxTensor = tf.nn.softmax(logits, name: scoreColumnName);
+
+            tf.summary.histogram("activations", _softMaxTensor);
+            if (!isTraining)
+                return (null, null, _labelTensor, _softMaxTensor);
+
+            Tensor crossEntropyMean = null;
+            tf_with(tf.name_scope("cross_entropy"), delegate
+            {
+                crossEntropyMean = tf.losses.sparse_softmax_cross_entropy(
+                    labels: _labelTensor, logits: logits);
+            });
+
+            tf.summary.scalar("cross_entropy", crossEntropyMean);
+
+            tf_with(tf.name_scope("train"), delegate
+            {
+                var optimizer = tf.train.AdamOptimizer(learningRate);
+                _trainStep = optimizer.minimize(crossEntropyMean);
+            });
+
+            return (_trainStep, crossEntropyMean, _labelTensor, _softMaxTensor);
+        }
+
         private (Operation, Tensor, Tensor, Tensor) AddFinalRetrainOps(int classCount, string labelColumn,
             string scoreColumnName, float learningRate, Tensor bottleneckTensor, bool isTraining)
         {
@@ -914,7 +976,7 @@ namespace Microsoft.ML.Transforms
                 // Configure bottleneck tensor based on the model.
                 if (arch == DnnEstimator.Architecture.ResnetV2101)
                     _bottleneckOperationName = "resnet_v2_101/SpatialSqueeze";
-                else if(arch == DnnEstimator.Architecture.InceptionV3)
+                else if (arch == DnnEstimator.Architecture.InceptionV3)
                     _bottleneckOperationName = "module_apply_default/hub_output/feature_vector/SpatialSqueeze";
 
                 if (arch == DnnEstimator.Architecture.ResnetV2101)
@@ -1612,6 +1674,494 @@ namespace Microsoft.ML.Transforms
         }
     }
 
+    // OD Change - Convolution methods for YoloV3 Object Class
+    internal class Common
+    {
+        public Tensor convolutional(Tensor input_data, TensorShape filters_shape, bool trainable, string name, bool activate = true, bool bn = true)
+        {
+            Tensor conv = tf.random_normal(null); // For return error
+
+            tf_with(tf.variable_scope(name), delegate
+            {
+                var strides = new int[] { 1, 1, 1, 1 };
+                var padding = "SAME";
+                var weight = tf.get_variable(name: "weight", shape: filters_shape, dtype: tf.float32, initializer: tf.random_normal(filters_shape), true);
+                conv = tf.nn.conv2d(input_data, weight, strides, padding);
+
+                // Batch Normalization
+                if (bn)
+                {
+                    conv = tf.layers.batch_normalization(conv, beta_initializer: tf.zeros_initializer,
+                        gamma_initializer: tf.ones_initializer, moving_mean_initializer: tf.zeros_initializer, moving_variance_initializer: tf.ones_initializer, trainable: trainable);
+                }
+                else
+                {
+                    // Replace filters_shape[-1] with Slice implementation
+                    var bias = tf.get_variable(name = "bias", shape: filters_shape[new Slice(filters_shape.dims.Length - 1, filters_shape.dims.Length)], trainable: true,
+                                   dtype: tf.float32, initializer: tf.truncated_normal_initializer((float)0.0));
+                    conv = tf.nn.bias_add(conv, bias);
+                }
+
+                // Activation
+                if (activate) conv = tf_leakyrelu(conv, (float)0.1);
+            });
+            return conv;
+        }
+
+        public Tensor tf_leakyrelu(Tensor conv, float alpha)
+        {
+            return tf.nn.relu(conv) - alpha * tf.nn.relu(-1 * conv);
+        }
+
+        public Tensor residual_block(Tensor input_data, int input_channel, int filter_num1, int filter_num2, bool trainable, string name)
+        {
+            Tensor residual_output = tf.random_normal(null); // For return error
+
+            var short_cut = input_data;
+            tf_with(tf.variable_scope(name), delegate
+            {
+                input_data = convolutional(input_data, new TensorShape(1, 1, input_channel, filter_num1),
+                                   trainable: trainable, name = "conv1");
+                input_data = convolutional(input_data, new TensorShape(3, 3, filter_num1, filter_num2),
+                                           trainable: trainable, name = "conv2");
+
+                residual_output = input_data + short_cut;
+            });
+            return residual_output;
+        }
+
+        public Tensor route(string name, Tensor previous_output, Tensor current_output)
+        {
+            Tensor output = tf.random_normal(null); // For return error
+
+            tf_with(tf.variable_scope(name), delegate
+            {
+                output = tf.concat(new List<Tensor> { current_output, previous_output }, axis: -1);
+            });
+            return output;
+        }
+
+        public Tensor upsample(Tensor input_data, string name, string method = "deconv")
+        {
+            Tensor output = tf.random_normal(null); // For return error
+
+            if (method.Equals("resize"))
+            {
+                tf_with(tf.variable_scope(name), delegate
+                {
+                    var input_shape = input_data.TensorShape;
+                    output = tf.image.resize_bilinear(input_data, new Tensor(new int[] { input_shape[1] * 2, input_shape[2] * 2 }));
+                });
+            } else
+            {
+                // replace resize_nearest_neighbor with conv2d_transpose To support TensorRT optimization
+                var num_filter = input_data.TensorShape.dims.Length;
+                output = tf.layers.conv2d(input_data, num_filter, kernel_size: new int[] { 2 }, padding: "same",
+                    strides: new int[] { 2, 2 }, kernel_initializer: tf.zeros_initializer);
+            }
+            return output;
+        }
+    }
+
+    // OD Change - Darknet YoloV3 Implementation
+    internal class Darknet53
+    {
+        public (Tensor, Tensor, Tensor) darknet53(Tensor input_data, bool trainable)
+        {
+            tf_with(tf.variable_scope("darknet"), delegate
+            {
+                Common common = new Common();
+                input_data = common.convolutional(input_data, filters_shape: (3, 3, 3, 32), trainable: trainable, name: "conv0");
+                input_data = common.convolutional(input_data, filters_shape: (3, 3, 32, 64),
+                    trainable = trainable, name: "conv1");
+
+                for (int i = 0; i < 1; i++)
+                {
+                    input_data = common.residual_block(input_data, 64, 32, 64, trainable: trainable, name: textmod("residual%d", i));
+                }
+
+                input_data = common.convolutional(input_data, filters_shape: (3, 3, 64, 128), trainable: trainable, name: "conv4");
+
+                for (int i = 0; i < 2; i++)
+                {
+                    input_data = common.residual_block(input_data, 128, 64, 128, trainable: trainable, name: textmod("residual%d", i + 1));
+                }
+
+                input_data = common.convolutional(input_data, filters_shape: (3, 3, 128, 256), trainable: trainable, name: "conv4");
+
+                for (int i = 0; i < 8; i++)
+                {
+                    input_data = common.residual_block(input_data, 256, 128, 256, trainable: trainable, name: textmod("residual%d", i + 3));
+                }
+                var route_1 = input_data;
+                input_data = common.convolutional(input_data, filters_shape: (3, 3, 256, 512), trainable: trainable, name: "conv4");
+
+                for (int i = 0; i < 8; i++)
+                {
+                    input_data = common.residual_block(input_data, 512, 256, 512, trainable: trainable, name: textmod("residual%d", i + 11));
+                }
+                var route_2 = input_data;
+                input_data = common.convolutional(input_data, filters_shape: (3, 3, 512, 1024), trainable: trainable, name: "conv4");
+
+                for (int i = 0; i < 4; i++)
+                {
+                    input_data = common.residual_block(input_data, 1024, 512, 1024, trainable: trainable, name: textmod("residual%d", i + 19));
+                }
+
+                return (route_1, route_2, input_data);
+            });
+            return (null, null, null); // For return error
+        }
+
+        public string textmod(string str, int i)
+        {
+            return str.Substring(0, str.IndexOf("%")) + i;
+        }
+    }
+
+    // OD Change: Model Configuration
+    internal class Configuration
+    {
+        // YOLO Constants
+
+        public const string YOLO_CLASSES                = "./data/classes/coco.names";
+        public const string YOLO_ANCHORS                = "./data/anchors/basline_anchors.txt";
+        public const double YOLO_MOVING_AVE_DECAY       = 0.9995;
+        public static int[] YOLO_STRIDES                = new int[] {8, 16, 32};
+        public const int    YOLO_ANCHOR_PER_SCALE       = 3;
+        public const double YOLO_IOU_LOSS_THRESH        = 0.5;
+        public const string YOLO_UPSAMPLE_METHOD        = "resize";
+        public const string YOLO_ORIGINAL_WEIGHT        = "./checkpoint/yolov3_coco.ckpt";
+        public const string YOLO_DEMO_WEIGHT            = "./checkpoint/yolov3_coco_demo.ckpt";
+
+        // TRAIN Constants
+
+        public const string TRAIN_ANNOT_PATH                  = "./data/dataset/voc_train.txt";
+        public const double TRAIN_BATCH_SIZE                  = 6;
+        public int[]        TRAIN_INPUT_SIZE                  = new int[] {320, 352, 384, 416, 448, 480, 512, 544, 576, 608};
+        public const bool   TRAIN_DATA_AUG                    = true;
+        public const double TRAIN_LEARN_RATE_INIT             = 1e-4;
+        public const double TRAIN_LEARN_RATE_END              = 1e-6;
+        public const double TRAIN_WARMUP_EPOCHS               = 2;
+        public const double TRAIN_FISRT_STAGE_EPOCHS          = 20;
+        public const double TRAIN_SECOND_STAGE_EPOCHS         = 30;
+        public const string TRAIN_INITIAL_WEIGHT              = "./checkpoint/yolov3_coco_demo.ckpt";
+
+        // TEST Constants
+
+        public const string TEST_ANNOT_PATH                   = "./data/dataset/voc_test.txt";
+        public const int    TEST_BATCH_SIZE                   = 2;
+        public const int    TEST_INPUT_SIZE                   = 544;
+        public const bool   TEST_DATA_AUG                     = false;
+        public const bool   TEST_WRITE_IMAGE                  = true;
+        public const string TEST_WRITE_IMAGE_PATH             = "./data/detection/";
+        public const bool   TEST_WRITE_IMAGE_SHOW_LABEL       = true;
+        public const string TEST_WEIGHT_FILE                  = "./checkpoint/yolov3_test_loss=9.2099.ckpt-5";
+        public const bool   TEST_SHOW_LABEL                   = true;
+        public const double TEST_SCORE_THRESHOLD              = 0.3;
+        public const double TEST_IOU_THRESHOLD                = 0.45;
+
+    }
+
+    // OD Change: Model Constructor
+    internal class YoloV3
+    {
+        public bool trainable;
+        static OD_Utils utils = new OD_Utils();
+        public static string[] classes = utils.read_class_names(Configuration.YOLO_CLASSES);
+        public int num_classes = classes.Length;
+        public NDArray strides = np.array(Configuration.YOLO_STRIDES);
+        public int anchor_per_scale = Configuration.YOLO_ANCHOR_PER_SCALE;
+        public double iou_loss_thresh = Configuration.YOLO_IOU_LOSS_THRESH;
+        public string upsample_method = Configuration.YOLO_UPSAMPLE_METHOD;
+        public Tensor conv_lbbox, conv_mbbox, conv_sbbox;
+        public NDArray anchors = utils.get_anchors(Configuration.YOLO_ANCHORS);
+        public Tensor pred_sbbox, pred_mbbox, pred_lbbox;
+        public void initialize(Tensor input_data, bool trainable)
+        {
+            this.trainable = trainable;
+            try
+            {
+                (conv_lbbox, conv_mbbox, conv_sbbox) = build_network(input_data);
+            }
+            catch (NotImplementedException)
+            {
+                Console.WriteLine("Could not build YOLOv3 network.");
+            }
+
+            tf_with(tf.variable_scope("pred_sbbox"), delegate
+            {
+                pred_sbbox = decode(conv_sbbox, anchors[0], strides[0]);
+            });
+
+            tf_with(tf.variable_scope("pred_mbbox"), delegate
+            {
+                pred_mbbox = decode(conv_mbbox, anchors[1], strides[1]);
+            });
+
+            tf_with(tf.variable_scope("pred_lbbox"), delegate
+            {
+                pred_lbbox = decode(conv_lbbox, anchors[2], strides[2]);
+            });
+        }
+
+        public (Tensor, Tensor, Tensor) build_network(Tensor input_data)
+        {
+            Darknet53 backbone = new Darknet53();
+            Tensor route_1, route_2;
+            (route_1, route_2, input_data) = backbone.darknet53(input_data, trainable);
+
+            Common common = new Common();
+            input_data = common.convolutional(input_data, (1, 1, 1024, 512), trainable, "conv52");
+            input_data = common.convolutional(input_data, (3, 3, 512, 1024), trainable, "conv53");
+            input_data = common.convolutional(input_data, (1, 1, 1024, 512), trainable, "conv54");
+            input_data = common.convolutional(input_data, (3, 3, 512, 1024), trainable, "conv55");
+            input_data = common.convolutional(input_data, (1, 1, 1024, 512), trainable, "conv56");
+
+            Tensor conv_lobj_branch = common.convolutional(input_data, (3, 3, 512, 1024), trainable, name: "conv_lobj_branch");
+            Tensor conv_lbbox = common.convolutional(conv_lobj_branch, (1, 1, 1024, 3 * (num_classes + 5)),
+                trainable: trainable, name: "conv_lbbox", bn: false, activate: false);
+
+            input_data = common.convolutional(input_data, (1, 1, 512, 256), trainable, "conv57");
+            input_data = common.upsample(input_data, name: "upsample0", method: upsample_method);
+
+            tf_with(tf.variable_scope("route_1"), delegate
+            {
+                List<Tensor> tensorList = new List<Tensor>();
+                tensorList.Insert(0, input_data);
+                tensorList.Insert(1, route_2);
+                input_data = tf.concat(tensorList, axis: -1);
+            });
+
+            input_data = common.convolutional(input_data, (1, 1, 768, 256), trainable, "conv58");
+            input_data = common.convolutional(input_data, (3, 3, 256, 512), trainable, "conv59");
+            input_data = common.convolutional(input_data, (1, 1, 512, 256), trainable, "conv60");
+            input_data = common.convolutional(input_data, (3, 3, 256, 512), trainable, "conv61");
+            input_data = common.convolutional(input_data, (1, 1, 512, 256), trainable, "conv62");
+
+            Tensor conv_mobj_branch = common.convolutional(input_data, (3, 3, 256, 512), trainable, name: "conv_mobj_branch");
+            Tensor conv_mbbox = common.convolutional(conv_mobj_branch, (1, 1, 512, 3 * (num_classes + 5)),
+                                          trainable: trainable, name: "conv_mbbox", activate: false, bn: false);
+
+            input_data = common.convolutional(input_data, (1, 1, 256, 128), trainable, "conv63");
+            input_data = common.upsample(input_data, name: "upsample1", method: upsample_method);
+
+            tf_with(tf.variable_scope("route_2"), delegate
+            {
+                List<Tensor> tensorList = new List<Tensor>();
+                tensorList.Insert(0, input_data);
+                tensorList.Insert(1, route_1);
+                input_data = tf.concat(tensorList, axis: -1);
+            });
+
+            input_data = common.convolutional(input_data, (1, 1, 384, 128), trainable, "conv64");
+            input_data = common.convolutional(input_data, (3, 3, 128, 256), trainable, "conv65");
+            input_data = common.convolutional(input_data, (1, 1, 256, 128), trainable, "conv66");
+            input_data = common.convolutional(input_data, (3, 3, 128, 256), trainable, "conv67");
+            input_data = common.convolutional(input_data, (1, 1, 256, 128), trainable, "conv68");
+
+            Tensor conv_sobj_branch = common.convolutional(input_data, (3, 3, 128, 256), trainable, name: "conv_sobj_branch");
+            Tensor conv_sbbox = common.convolutional(conv_sobj_branch, (1, 1, 256, 3 * (num_classes + 5)),
+                                          trainable = trainable, name: "conv_sbbox", activate: false, bn: false);
+
+            return (conv_lbbox, conv_mbbox, conv_sbbox);
+        }
+
+        public Tensor decode(Tensor conv_output, NDArray anchors, NDArray stride)
+        {
+            var conv_shape = conv_output.TensorShape;
+            var batch_size = conv_shape[0];
+            var output_size = conv_shape[1];
+            var anchor_per_scale = anchors.len;
+
+            conv_output = tf.reshape(conv_output, new int[] {batch_size, output_size, output_size, anchor_per_scale, 5 + num_classes});
+
+            var conv_raw_dxdy = conv_output[:, :, :, :, 0:2];
+            var conv_raw_dwdh = conv_output[:, :, :, :, 2:4];
+            var conv_raw_conf = conv_output[:, :, :, :, 4:5];
+            var conv_raw_prob = conv_output[:, :, :, :, 5: ];
+
+        }
+
+        public Tensor focal(float target, float actual, int alpha = 1, double gamma = 2)
+        {
+            return new Tensor(alpha * Math.Pow(target - actual, gamma));
+        }
+
+        public float bbox_giou(Tensor boxes1, Tensor boxes2)
+        {
+            boxes1 = tf.concat([boxes1[..., :2] - boxes1[..., 2:] * 0.5,
+                            boxes1[..., :2] + boxes1[..., 2:] * 0.5], axis = -1);
+            boxes2 = tf.concat([boxes2[..., :2] - boxes2[..., 2:] * 0.5,
+                                boxes2[..., :2] + boxes2[..., 2:] * 0.5], axis = -1);
+
+            boxes1 = tf.concat([tf.minimum(boxes1[..., :2], boxes1[..., 2:]),
+                                tf.maximum(boxes1[..., :2], boxes1[..., 2:])], axis = -1);
+            boxes2 = tf.concat([tf.minimum(boxes2[..., :2], boxes2[..., 2:]),
+                                tf.maximum(boxes2[..., :2], boxes2[..., 2:])], axis = -1);
+
+            var boxes1_area = (boxes1[..., 2] - boxes1[..., 0]) * (boxes1[..., 3] - boxes1[..., 1]);
+            var boxes2_area = (boxes2[..., 2] - boxes2[..., 0]) * (boxes2[..., 3] - boxes2[..., 1]);
+
+            var left_up = tf.maximum(boxes1[..., :2], boxes2[..., :2]);
+            var right_down = tf.minimum(boxes1[..., 2:], boxes2[..., 2:]);
+
+            var inter_section = tf.maximum(right_down - left_up, 0.0);
+            var inter_area = inter_section[..., 0] * inter_section[..., 1];
+            var union_area = boxes1_area + boxes2_area - inter_area;
+            var iou = inter_area / union_area;
+
+            var enclose_left_up = tf.minimum(boxes1[..., :2], boxes2[..., :2]);
+            var enclose_right_down = tf.maximum(boxes1[..., 2:], boxes2[..., 2:]);
+            var enclose = tf.maximum(enclose_right_down - enclose_left_up, 0.0);
+            var enclose_area = enclose[..., 0] * enclose[..., 1];
+            var giou = iou - 1.0 * (enclose_area - union_area) / enclose_area;
+
+            return giou;
+        }
+
+        public float bbox_iou(Tensor boxes1, Tensor boxes2)
+        {
+            var boxes1_area = boxes1[..., 2] * boxes1[..., 3];
+            var boxes2_area = boxes2[..., 2] * boxes2[..., 3];
+
+            var boxes1 = tf.concat([boxes1[..., :2] - boxes1[..., 2:] * 0.5,
+                             boxes1[..., :2] + boxes1[..., 2:] * 0.5], axis = -1);
+            var boxes2 = tf.concat([boxes2[..., :2] - boxes2[..., 2:] * 0.5,
+                             boxes2[..., :2] + boxes2[..., 2:] * 0.5], axis = -1);
+
+            var left_up = tf.maximum(boxes1[..., :2], boxes2[..., :2]);
+            var right_down = tf.minimum(boxes1[..., 2:], boxes2[..., 2:]);
+
+            var inter_section = tf.maximum(right_down - left_up, 0.0);
+            var inter_area = inter_section[..., 0] * inter_section[..., 1];
+            var union_area = boxes1_area + boxes2_area - inter_area;
+            var iou = 1.0 * inter_area / union_area;
+
+            return iou;
+        }
+
+        public (float, float, float) loss_layer(Tensor conv, Tensor pred, Tensor label, Tensor bboxes, NDArray anchors, NDArray stride)
+        {
+            var conv_shape = conv.TensorShape;
+            var batch_size = conv_shape[0];
+            var output_size = conv_shape[1];
+            var input_size = stride * output_size;
+            conv = tf.reshape(conv, new TensorShape(batch_size, output_size, output_size,
+                                 anchor_per_scale, 5 + num_classes));
+            var conv_raw_conf = conv[:, :, :, :, 4:5];
+            var conv_raw_prob = conv[:, :, :, :, 5:];
+
+            var pred_xywh = pred[:, :, :, :, 0:4];
+            var pred_conf = pred[:, :, :, :, 4:5];
+
+            var label_xywh = label[:, :, :, :, 0:4];
+            var respond_bbox = label[:, :, :, :, 4:5];
+            var label_prob = label[:, :, :, :, 5:];
+
+            var giou = tf.expand_dims(bbox_giou(pred_xywh, label_xywh), axis: -1);
+            input_size = tf.cast(input_size, tf.float32);
+
+            var bbox_loss_scale = 2.0 - 1.0 * label_xywh[:, :, :, :, 2:3] * label_xywh[:, :, :, :, 3:4] / (input_size * *2);
+            var giou_loss = respond_bbox * bbox_loss_scale * (1 - giou);
+
+            // Replacing np.newaxis with tf.expand_dims
+            bboxes = tf.expand_dims(pred_xywh, -3);
+            bboxes = tf.expand_dims(pred_xywh, -4);
+            bboxes = tf.expand_dims(pred_xywh, -5);
+            var iou = bbox_iou(tf.expand_dims(pred_xywh, -2), bboxes);
+            var max_iou = tf.expand_dims(tf.reduce_max(new Tensor(iou), axis: new int[] { -1 }), axis: -1);
+
+            var respond_bgd = (1.0 - respond_bbox) * tf.cast(max_iou < iou_loss_thresh, tf.float32);
+
+            var conf_focal = focal(respond_bbox, pred_conf);
+
+            var conf_loss = conf_focal * (
+                respond_bbox * tf_sigmoid_cross_entropy_with_logits(labels: respond_bbox, logits: conv_raw_conf)
+                +
+                respond_bgd * tf_sigmoid_cross_entropy_with_logits(labels: respond_bbox, logits: conv_raw_conf)
+            );
+
+            var prob_loss = respond_bbox * tf_sigmoid_cross_entropy_with_logits(labels: label_prob, logits: conv_raw_prob);
+
+            giou_loss = tf.reduce_mean(tf.reduce_sum(giou_loss, axis: [1, 2, 3, 4]));
+            conf_loss = tf.reduce_mean(tf.reduce_sum(conf_loss, axis: [1, 2, 3, 4]));
+            prob_loss = tf.reduce_mean(tf.reduce_sum(prob_loss, axis: [1, 2, 3, 4]));
+
+            return (giou_loss, conf_loss, prob_loss);
+        }
+
+        public Tensor tf_sigmoid_cross_entropy_with_logits(Tensor labels, Tensor logits)
+        {
+            float x = (float)0;
+            return tf.max(logits.ToTFDataType(x.GetType()), 0) - logits * labels + tf.log(1 + tf.exp(-tf.abs(logits)));
+        }
+
+        public (float, float, float) compute_loss(Tensor label_sbbox, Tensor label_mbbox, Tensor label_lbbox, Tensor true_sbbox, Tensor true_mbbox, Tensor true_lbbox)
+        {
+            (float, float, float) loss_sbbox = (0, 0, 0);
+            (float, float, float) loss_mbbox = (0, 0, 0);
+            (float, float, float) loss_lbbox = (0, 0, 0);
+            float giou_loss = 0, conf_loss = 0, prob_loss = 0;
+            tf_with(tf.variable_scope("smaller_box_loss"), delegate
+            {
+                loss_sbbox = loss_layer(conv_sbbox, pred_sbbox, label_sbbox, true_sbbox,
+                                         anchors: anchors[0], stride: strides[0]);
+            });
+
+            tf_with(tf.variable_scope("medium_box_loss"), delegate
+            {
+                loss_mbbox = loss_layer(conv_mbbox, pred_mbbox, label_mbbox, true_mbbox,
+                                         anchors: anchors[1], stride: strides[1]);
+            });
+
+            tf_with(tf.variable_scope("bigger_box_loss"), delegate
+            {
+                loss_lbbox = loss_layer(conv_lbbox, pred_lbbox, label_lbbox, true_lbbox,
+                                         anchors: anchors[2], stride: strides[2]);
+            });
+
+            tf_with(tf.variable_scope("giou_loss"), delegate
+            {
+                giou_loss = loss_sbbox.Item1 + loss_mbbox.Item1 + loss_lbbox.Item1;
+            });
+
+            tf_with(tf.variable_scope("conf_loss"), delegate
+            {
+                conf_loss = loss_sbbox.Item2 + loss_mbbox.Item2 + loss_lbbox.Item2;
+            });
+
+            tf_with(tf.variable_scope("prob_loss"), delegate
+            {
+                prob_loss = loss_sbbox.Item3 + loss_mbbox.Item3 + loss_lbbox.Item3;
+            });
+
+            return (giou_loss, conf_loss, prob_loss);
+        }
+    }
+
+    // OD Change: YOLOv3 Util Methods
+    internal class OD_Utils
+    {
+        public string[] read_class_names(string class_file_name)
+        {
+            string[] names = new string[] {};
+            int i = 0;
+            foreach (string line in File.ReadLines(class_file_name, Encoding.UTF8))
+            {
+                names[i] = line.Substring(0, line.Length - 2);
+                i++;
+            }
+            return names;
+        }
+
+        public NDArray get_anchors(string anchors_path)
+        {
+            string anchors = File.ReadAllText(anchors_path, Encoding.UTF8);
+            return np.array(anchors.Split(','), dtype: np.float32).reshape(new int[] { 3, 3, 2 });
+        }
+    }
+
     /// <include file='doc.xml' path='doc/members/member[@name="DnnTransformer"]/*' />
     public sealed class DnnEstimator : IEstimator<DnnTransformer>
     {
@@ -1621,7 +2171,8 @@ namespace Microsoft.ML.Transforms
         public enum Architecture
         {
             ResnetV2101,
-            InceptionV3
+            InceptionV3,
+            YoloV3 // OD Change
         };
 
         /// <summary>
