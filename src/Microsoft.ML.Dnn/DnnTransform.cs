@@ -726,6 +726,58 @@ namespace Microsoft.ML.Transforms
         private (Operation, Tensor, Tensor, Tensor) AddObjectDetectionFinalRetrainOps(int classCount, string labelColumn,
             string scoreColumnName, float learningRate, Tensor bottleneckTensor, bool isTraining)
         {
+            var anchor_per_scale = Configuration.YOLO_ANCHOR_PER_SCALE;
+            OD_Utils utils = new OD_Utils();
+            var classes = utils.read_class_names(Configuration.YOLO_CLASSES);
+            var num_classes = classes.Length;
+            var learn_rate_init = Configuration.TRAIN_LEARN_RATE_INIT;
+            var learn_rate_end = Configuration.TRAIN_LEARN_RATE_END;
+            var first_stage_epochs = Configuration.TRAIN_FISRT_STAGE_EPOCHS;
+            var second_stage_epochs = Configuration.TRAIN_SECOND_STAGE_EPOCHS;
+            var warmup_periods = Configuration.TRAIN_WARMUP_EPOCHS;
+            var initial_weight = Configuration.TRAIN_INITIAL_WEIGHT;
+            var moving_ave_decay = Configuration.YOLO_MOVING_AVE_DECAY;
+            var max_bbox_per_scale = 150;
+            var train_logdir = "./data/log/train";
+            var trainset = Dataset('train');
+            var testset = Dataset('test');
+            var steps_per_period = len(self.trainset);
+
+            Tensor input_data = null, label_sbbox = null, label_mbbox = null, label_lbbox = null, true_sbboxes = null, true_mbboxes = null, true_lbboxes = null, trainable = null;
+            YoloV3 model;
+            VariableV1[] net_var;
+            Tensor giou_loss, conf_loss, prob_loss, loss;
+            RefVariable global_step;
+
+            tf_with(tf.name_scope("define_input"), scope =>
+            {
+                input_data = tf.placeholder(dtype: tf.float32, name: "input_data");
+                label_sbbox = tf.placeholder(dtype: tf.float32, name: "label_sbbox");
+                label_mbbox = tf.placeholder(dtype: tf.float32, name: "label_mbbox");
+                label_lbbox = tf.placeholder(dtype: tf.float32, name: "label_lbbox"); ;
+                true_sbboxes = tf.placeholder(dtype: tf.float32, name: "sbboxes");
+                true_mbboxes = tf.placeholder(dtype: tf.float32, name: "mbboxes");
+                true_lbboxes = tf.placeholder(dtype: tf.float32, name: "lbboxes");
+                trainable = tf.placeholder(TF_DataType.TF_BOOL, name: "training");
+            });
+
+            tf_with(tf.name_scope("define_loss"), scope =>
+            {
+                model = new YoloV3(input_data, (bool)trainable);
+                net_var = tf.global_variables();
+                (giou_loss, conf_loss, prob_loss) = model.compute_loss(label_sbbox, label_mbbox, label_lbbox, true_sbboxes, true_mbboxes, true_lbboxes);
+                loss = giou_loss + conf_loss + prob_loss;
+            });
+
+            tf_with(tf.name_scope("learn_rate"), scope =>
+            {
+                global_step = tf.Variable(1.0, dtype: tf.float64, trainable: false, name: "global_step");
+                var warmup_steps = tf.constant(warmup_periods * steps_per_period,
+                                        dtype: tf.float64, name: "warmup_steps");
+                var train_steps = tf.constant((first_stage_epochs + second_stage_epochs) * steps_per_period,
+                                        dtype: tf.float64, name: "train_steps");
+            });
+
             var (batch_size, bottleneck_tensor_size) = (bottleneckTensor.TensorShape.Dimensions[0], bottleneckTensor.TensorShape.Dimensions[1]);
             tf_with(tf.name_scope("input"), scope =>
             {
@@ -1838,7 +1890,7 @@ namespace Microsoft.ML.Transforms
 
         public const string TRAIN_ANNOT_PATH                  = "./data/dataset/voc_train.txt";
         public const double TRAIN_BATCH_SIZE                  = 6;
-        public int[]        TRAIN_INPUT_SIZE                  = new int[] {320, 352, 384, 416, 448, 480, 512, 544, 576, 608};
+        public static int[]        TRAIN_INPUT_SIZE                  = new int[] {320, 352, 384, 416, 448, 480, 512, 544, 576, 608};
         public const bool   TRAIN_DATA_AUG                    = true;
         public const double TRAIN_LEARN_RATE_INIT             = 1e-4;
         public const double TRAIN_LEARN_RATE_END              = 1e-6;
@@ -1877,7 +1929,7 @@ namespace Microsoft.ML.Transforms
         public Tensor conv_lbbox, conv_mbbox, conv_sbbox;
         public NDArray anchors = utils.get_anchors(Configuration.YOLO_ANCHORS);
         public Tensor pred_sbbox, pred_mbbox, pred_lbbox;
-        public void initialize(Tensor input_data, bool trainable)
+        public YoloV3(Tensor input_data, bool trainable)
         {
             this.trainable = trainable;
             try
@@ -2203,6 +2255,55 @@ namespace Microsoft.ML.Transforms
         {
             string anchors = File.ReadAllText(anchors_path, Encoding.UTF8);
             return np.array(anchors.Split(','), dtype: np.float32).reshape(new int[] { 3, 3, 2 });
+        }
+    }
+
+    // OD Change: Dataset processing
+    internal class Dataset
+    {
+        string annot_path;
+        int[] input_sizes;
+        double batch_size;
+        bool data_aug;
+        int[] train_input_sizes;
+        NDArray strides;
+        string[] classes;
+        int num_classes;
+        NDArray anchors;
+        int anchor_per_scale;
+        int max_bbox_per_scale;
+        int num_samples;
+        int num_batchs;
+        int batch_count;
+
+        public Dataset(string dataset_type)
+        {
+            if (dataset_type == "train") annot_path = Configuration.TRAIN_ANNOT_PATH;
+            else annot_path = Configuration.TEST_ANNOT_PATH;
+
+            if (dataset_type == "train") input_sizes = Configuration.TRAIN_INPUT_SIZE;
+            else input_sizes = Configuration.TEST_INPUT_SIZE;
+
+            if (dataset_type == "train")  batch_size = Configuration.TRAIN_BATCH_SIZE;
+            else batch_size = Configuration.TEST_BATCH_SIZE;
+
+            if (dataset_type == "train") data_aug = Configuration.TRAIN_DATA_AUG;
+            else data_aug = Configuration.TEST_DATA_AUG;
+
+            train_input_sizes = Configuration.TRAIN_INPUT_SIZE;
+            strides = np.array(Configuration.YOLO_STRIDES);
+
+            OD_Utils utils = new OD_Utils();
+            classes = utils.read_class_names(Configuration.YOLO_CLASSES);
+            num_classes = classes.Length;
+            anchors = np.array(utils.get_anchors(Configuration.YOLO_ANCHORS));
+            anchor_per_scale = Configuration.YOLO_ANCHOR_PER_SCALE;
+            max_bbox_per_scale = 150;
+
+            annotations = load_annotations(dataset_type);
+            num_samples = annotations.Length;
+            num_batchs = int(np.ceil(num_samples / batch_size));
+            batch_count = 0;
         }
     }
 
