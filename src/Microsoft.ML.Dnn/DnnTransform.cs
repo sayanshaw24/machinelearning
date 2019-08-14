@@ -2071,94 +2071,114 @@ namespace Microsoft.ML.Transforms
             return tf.concat(new[] { pred_xywh, pred_conf, pred_prob }, axis: -1);
         }
 
-        private Tensor slice(Tensor input, int[] start, int[] end) //for size 5 only
+        // Slices tensor with the specified start and end for each dimension
+        private Tensor slice(Tensor input, int[] start, int[] end)
         {
             Tensor s = new Tensor(start);
             Tensor e = new Tensor(end);
-            Tensor stride = new Tensor(new[] { 1, 1, 1, 1, 1 });
-            return tf.strided_slice(input, s, e, stride);
+            int[] stride = new int[input.TensorShape.dims.Length];
+            for (int i = 0; i < stride.Length; i++) { stride[i] = 1;  }
+            Tensor stride_tensor = new Tensor(stride);
+            return tf.strided_slice(input, s, e, stride_tensor);
         }
 
-        public Tensor focal(float target, float actual, int alpha = 1, double gamma = 2)
+        // Slices tensor's last dimension at the specified start and end
+        private Tensor slice(Tensor input, int start, int end)
         {
-            return new Tensor(alpha * Math.Pow(target - actual, gamma));
+            int[] s = new int[input.TensorShape.dims.Length];
+            int[] e = new int[input.TensorShape.dims.Length];
+            for (int i = 0; i < s.Length-1; i++)
+            {
+                s[i] = 0;
+                e[i] = input.TensorShape.dims[i];
+            }
+            s[s.Length - 1] = start;
+            e[e.Length - 1] = end > 0 ? end : input.TensorShape.dims[e.Length - 1];
+            return slice(input, s, e);
         }
 
-        public float bbox_giou(Tensor boxes1, Tensor boxes2)
+        public Tensor focal(Tensor target, Tensor actual, int alpha = 1, double gamma = 2)
         {
-            boxes1 = tf.concat([boxes1[..., :2] - boxes1[..., 2:] * 0.5,
-                            boxes1[..., :2] + boxes1[..., 2:] * 0.5], axis = -1);
-            boxes2 = tf.concat([boxes2[..., :2] - boxes2[..., 2:] * 0.5,
-                                boxes2[..., :2] + boxes2[..., 2:] * 0.5], axis = -1);
+            return new Tensor(alpha * tf.pow(target - actual, gamma));
+        }
 
-            boxes1 = tf.concat([tf.minimum(boxes1[..., :2], boxes1[..., 2:]),
-                                tf.maximum(boxes1[..., :2], boxes1[..., 2:])], axis = -1);
-            boxes2 = tf.concat([tf.minimum(boxes2[..., :2], boxes2[..., 2:]),
-                                tf.maximum(boxes2[..., :2], boxes2[..., 2:])], axis = -1);
+        public Tensor bbox_giou(Tensor boxes1, Tensor boxes2)
+        {
+            boxes1 = tf.concat(new[] {slice(boxes1, 0, 2) - slice(boxes1, 2, -1) * 0.5,
+                            slice(boxes1, 0, 2) - slice(boxes1, 2, -1) * 0.5 }, axis: -1);
+            boxes2 = tf.concat(new[] {slice(boxes2, 0, 2) - slice(boxes2, 2, -1) * 0.5,
+                                slice(boxes2, 0, 2) + slice(boxes2, 2, -1) * 0.5}, axis: -1);
 
-            var boxes1_area = (boxes1[..., 2] - boxes1[..., 0]) * (boxes1[..., 3] - boxes1[..., 1]);
-            var boxes2_area = (boxes2[..., 2] - boxes2[..., 0]) * (boxes2[..., 3] - boxes2[..., 1]);
+            boxes1 = tf.concat(new[] {tf.minimum(slice(boxes1, 0, 2), slice(boxes1, 2, -1)),
+                                tf.maximum(slice(boxes1, 0, 2), slice(boxes1, 2, -1)) }, axis: -1);
+            boxes2 = tf.concat(new[] {tf.minimum(slice(boxes2, 0, 2), slice(boxes2, 2, -1)),
+                                tf.maximum(slice(boxes2, 0, 2), slice(boxes2, 2, -1)) }, axis: -1);
 
-            var left_up = tf.maximum(boxes1[..., :2], boxes2[..., :2]);
-            var right_down = tf.minimum(boxes1[..., 2:], boxes2[..., 2:]);
+            //boxes1[..., 2] boxes1[..., 0] boxes1[..., 3] boxes1[..., 1] boxes2[..., 2] boxes2[..., 0] boxes2[..., 3] boxes2[..., 1]
+            var boxes1_area = (slice(boxes1, 2, 3) - slice(boxes1, 0, 1)) * (slice(boxes1, 3, 4) - slice(boxes1, 1, 2));
+            var boxes2_area = (slice(boxes2, 2, 3) - slice(boxes2, 0, 1)) * (slice(boxes2, 3, 4) - slice(boxes2, 1, 2));
+
+            var left_up = tf.maximum(slice(boxes1, 0, 2), slice(boxes2, 0, 2));
+            var right_down = tf.minimum(slice(boxes1, 2, -1), slice(boxes2, 2, -1));
 
             var inter_section = tf.maximum(right_down - left_up, 0.0);
-            var inter_area = inter_section[..., 0] * inter_section[..., 1];
+            var inter_area = slice(inter_section, 0, 1) * slice(inter_section, 1, 2);
             var union_area = boxes1_area + boxes2_area - inter_area;
             var iou = inter_area / union_area;
 
-            var enclose_left_up = tf.minimum(boxes1[..., :2], boxes2[..., :2]);
-            var enclose_right_down = tf.maximum(boxes1[..., 2:], boxes2[..., 2:]);
+            var enclose_left_up = tf.minimum(slice(boxes1, 0, 2), slice(boxes2, 0, 2));
+            var enclose_right_down = tf.maximum(slice(boxes1, 2, -1), slice(boxes2, 2, -1));
             var enclose = tf.maximum(enclose_right_down - enclose_left_up, 0.0);
-            var enclose_area = enclose[..., 0] * enclose[..., 1];
+            var enclose_area = slice(enclose, 0, 1) * slice(enclose, 1, 2);
             var giou = iou - 1.0 * (enclose_area - union_area) / enclose_area;
 
             return giou;
         }
 
-        public float bbox_iou(Tensor boxes1, Tensor boxes2)
+        public Tensor bbox_iou(Tensor boxes1, Tensor boxes2)
         {
-            var boxes1_area = boxes1[..., 2] * boxes1[..., 3];
-            var boxes2_area = boxes2[..., 2] * boxes2[..., 3];
 
-            var boxes1 = tf.concat([boxes1[..., :2] - boxes1[..., 2:] * 0.5,
-                             boxes1[..., :2] + boxes1[..., 2:] * 0.5], axis = -1);
-            var boxes2 = tf.concat([boxes2[..., :2] - boxes2[..., 2:] * 0.5,
-                             boxes2[..., :2] + boxes2[..., 2:] * 0.5], axis = -1);
+            var boxes1_area = slice(boxes1, 2, 3) * slice(boxes1, 3, 4);
+            var boxes2_area = slice(boxes2, 2, 3) * slice(boxes2, 3, 4);
 
-            var left_up = tf.maximum(boxes1[..., :2], boxes2[..., :2]);
-            var right_down = tf.minimum(boxes1[..., 2:], boxes2[..., 2:]);
+            boxes1 = tf.concat(new[] {slice(boxes1, 0, 2) - slice(boxes1, 2, -1) * 0.5,
+                             slice(boxes1, 0, 2) + slice(boxes1, 2, -1) * 0.5 }, axis: -1);
+            boxes2 = tf.concat(new[] { slice(boxes2, 0, 2) - slice(boxes2, 2, -1) * 0.5,
+                             slice(boxes2, 0, 2) + slice(boxes2, 2, -1) * 0.5}, axis: -1);
+
+            var left_up = tf.maximum(slice(boxes1, 0, 2), slice(boxes2, 0, 2));
+            var right_down = tf.minimum(slice(boxes1, 2, -1), slice(boxes2, 2, -1));
 
             var inter_section = tf.maximum(right_down - left_up, 0.0);
-            var inter_area = inter_section[..., 0] * inter_section[..., 1];
+            var inter_area = slice(inter_section, 0, 1) * slice(inter_section, 1, 2);
             var union_area = boxes1_area + boxes2_area - inter_area;
             var iou = 1.0 * inter_area / union_area;
 
             return iou;
         }
 
-        public (float, float, float) loss_layer(Tensor conv, Tensor pred, Tensor label, Tensor bboxes, NDArray anchors, NDArray stride)
+        public (Tensor, Tensor, Tensor) loss_layer(Tensor conv, Tensor pred, Tensor label, Tensor bboxes, NDArray anchors, NDArray stride)
         {
             var conv_shape = conv.TensorShape;
             var batch_size = conv_shape[0];
             var output_size = conv_shape[1];
-            var input_size = stride * output_size;
+            var input_size = stride * output_size; //NDArray
             conv = tf.reshape(conv, new TensorShape(batch_size, output_size, output_size,
                                  anchor_per_scale, 5 + num_classes));
-            var conv_raw_conf = conv[:, :, :, :, 4:5];
-            var conv_raw_prob = conv[:, :, :, :, 5:];
+            var conv_raw_conf = slice(conv, 4, 5);//conv[:, :, :, :, 4:5];
+            var conv_raw_prob = slice(conv, 5, -1);//conv[:, :, :, :, 5:];
 
-            var pred_xywh = pred[:, :, :, :, 0:4];
-            var pred_conf = pred[:, :, :, :, 4:5];
+            var pred_xywh = slice(pred, 0, 4);//pred[:, :, :, :, 0:4];
+            var pred_conf = slice(pred, 4, 5);//pred[:, :, :, :, 4:5];
 
-            var label_xywh = label[:, :, :, :, 0:4];
-            var respond_bbox = label[:, :, :, :, 4:5];
-            var label_prob = label[:, :, :, :, 5:];
+            var label_xywh = slice(label, 0, 4);//label[:, :, :, :, 0:4];
+            var respond_bbox = slice(label, 4, 5);//label[:, :, :, :, 4:5];
+            var label_prob = slice(label, 5, -1);//label[:, :, :, :, 5:];
 
             var giou = tf.expand_dims(bbox_giou(pred_xywh, label_xywh), axis: -1);
-            input_size = tf.cast(input_size, tf.float32);
+            var input_size_tensor = tf.cast(tf.convert_to_tensor(input_size), tf.float32);
 
-            var bbox_loss_scale = 2.0 - 1.0 * label_xywh[:, :, :, :, 2:3] * label_xywh[:, :, :, :, 3:4] / (input_size * *2);
+            var bbox_loss_scale = 2.0 - 1.0 * slice(label_xywh, 2, 3) * slice(label_xywh, 3, 4) / (tf.pow(input_size_tensor, 2));
             var giou_loss = respond_bbox * bbox_loss_scale * (1 - giou);
 
             // Replacing np.newaxis with tf.expand_dims
@@ -2180,9 +2200,12 @@ namespace Microsoft.ML.Transforms
 
             var prob_loss = respond_bbox * tf_sigmoid_cross_entropy_with_logits(labels: label_prob, logits: conv_raw_prob);
 
-            giou_loss = tf.reduce_mean(tf.reduce_sum(giou_loss, axis: [1, 2, 3, 4]));
-            conf_loss = tf.reduce_mean(tf.reduce_sum(conf_loss, axis: [1, 2, 3, 4]));
-            prob_loss = tf.reduce_mean(tf.reduce_sum(prob_loss, axis: [1, 2, 3, 4]));
+            for (int i = 1; i < 5; i++)
+            {
+                giou_loss = tf.reduce_mean(tf.reduce_sum(giou_loss, axis: i));
+                conf_loss = tf.reduce_mean(tf.reduce_sum(conf_loss, axis: i));
+                prob_loss = tf.reduce_mean(tf.reduce_sum(prob_loss, axis: i));
+            }
 
             return (giou_loss, conf_loss, prob_loss);
         }
@@ -2193,12 +2216,12 @@ namespace Microsoft.ML.Transforms
             return tf.max(logits.ToTFDataType(x.GetType()), 0) - logits * labels + tf.log(1 + tf.exp(-tf.abs(logits)));
         }
 
-        public (float, float, float) compute_loss(Tensor label_sbbox, Tensor label_mbbox, Tensor label_lbbox, Tensor true_sbbox, Tensor true_mbbox, Tensor true_lbbox)
+        public (Tensor, Tensor, Tensor) compute_loss(Tensor label_sbbox, Tensor label_mbbox, Tensor label_lbbox, Tensor true_sbbox, Tensor true_mbbox, Tensor true_lbbox)
         {
-            (float, float, float) loss_sbbox = (0, 0, 0);
-            (float, float, float) loss_mbbox = (0, 0, 0);
-            (float, float, float) loss_lbbox = (0, 0, 0);
-            float giou_loss = 0, conf_loss = 0, prob_loss = 0;
+            (Tensor, Tensor, Tensor) loss_sbbox = (null, null, null);
+            (Tensor, Tensor, Tensor) loss_mbbox = (null, null, null);
+            (Tensor, Tensor, Tensor) loss_lbbox = (null, null, null);
+            Tensor giou_loss = null, conf_loss = null, prob_loss = null;
             tf_with(tf.variable_scope("smaller_box_loss"), delegate
             {
                 loss_sbbox = loss_layer(conv_sbbox, pred_sbbox, label_sbbox, true_sbbox,
