@@ -1976,11 +1976,55 @@ namespace Microsoft.ML.Transforms
 
             conv_output = tf.reshape(conv_output, new int[] {batch_size, output_size, output_size, anchor_per_scale, 5 + num_classes});
 
-            var conv_raw_dxdy = conv_output[:, :, :, :, 0:2];
-            var conv_raw_dwdh = conv_output[:, :, :, :, 2:4];
-            var conv_raw_conf = conv_output[:, :, :, :, 4:5];
-            var conv_raw_prob = conv_output[:, :, :, :, 5: ];
+            //var conv_raw_dxdy = conv_output[:, :, :, :, 0:2];
+            //var conv_raw_dwdh = conv_output[:, :, :, :, 2:4];
+            //var conv_raw_conf = conv_output[:, :, :, :, 4:5];
+            //var conv_raw_prob = conv_output[:, :, :, :, 5: ];
+            // should be tf.slice, strided_slice with step 1 should be equivilant
+            //var ex_raw_dxdy = tf.slice(conv_output, [0, 0, 0, 0, 0], [batch_size, output_size, output_size, anchor_per_scale, 2]);
+            Tensor s1 = new Tensor(new[] { 0, 0, 0, 0, 0 });
+            Tensor e1 = new Tensor(new[] { batch_size, output_size, output_size, anchor_per_scale, 2 });
+            Tensor s2 = new Tensor(new[] { 0, 0, 0, 0, 2 });
+            Tensor e2 = new Tensor(new[] { batch_size, output_size, output_size, anchor_per_scale, 3 });
+            Tensor s3 = new Tensor(new[] { 0, 0, 0, 0, 4 });
+            Tensor e3 = new Tensor(new[] { batch_size, output_size, output_size, anchor_per_scale, 5 });
+            Tensor s4 = new Tensor(new[] { 0, 0, 0, 0, 5 });
+            Tensor e4 = new Tensor(new[] { batch_size, output_size, output_size, anchor_per_scale, 5 + num_classes });
+            Tensor s = new Tensor(new[] { 1, 1, 1, 1, 1 });
+            var conv_raw_dxdy = tf.strided_slice(conv_output, s1, e1, s);
+            var conv_raw_dwdh = tf.strided_slice(conv_output, s2, e2, s);
+            var conv_raw_conf = tf.strided_slice(conv_output, s3, e3, s);
+            var conv_raw_prob = tf.strided_slice(conv_output, s4, e4, s);
 
+            Int32[] range = new Int32[output_size];
+            for (int i = 0; i < output_size; i++) { range[i] = i; }
+            Tensor range_tensor = new Tensor(range, dType: tf.int32);
+
+            var y = tf.tile(tf.expand_dims(range_tensor, -1), new Tensor(new[] { 1, output_size }));
+            var x = tf.tile(tf.expand_dims(range_tensor, 1), new Tensor(new[] { output_size, 1 }));
+
+            var xy_grid = tf.concat(new[] { tf.expand_dims(x, -1), tf.expand_dims(y, -1) }, axis: -1);
+            xy_grid = tf.expand_dims(xy_grid, 0); xy_grid = tf.expand_dims(xy_grid, -2);
+            xy_grid = tf.tile(xy_grid, new Tensor(new[] { batch_size, 1, 1, anchor_per_scale, 1 }));
+            xy_grid = tf.cast(xy_grid, tf.float32);
+
+            var stride_tensor = tf.convert_to_tensor(stride);
+            var pred_xy = (tf.sigmoid(conv_raw_dxdy) + xy_grid) * stride_tensor;
+            var pred_wh = (tf.exp(conv_raw_dwdh) * tf.convert_to_tensor(anchors)) * stride_tensor;
+            var pred_xywh = tf.concat(new[] { pred_xy, pred_wh }, axis: -1);
+
+            var pred_conf = tf.sigmoid(conv_raw_conf);
+            var pred_prob = tf.sigmoid(conv_raw_prob);
+
+            return tf.concat(new[] { pred_xywh, pred_conf, pred_prob }, axis: -1);
+        }
+
+        private Tensor slice(Tensor input, int[] start, int[] end) //for size 5 only
+        {
+            Tensor s = new Tensor(start);
+            Tensor e = new Tensor(end);
+            Tensor stride = new Tensor(new[] { 1, 1, 1, 1, 1 });
+            return tf.strided_slice(input, s, e, stride);
         }
 
         public Tensor focal(float target, float actual, int alpha = 1, double gamma = 2)
