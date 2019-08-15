@@ -19,6 +19,7 @@ using Microsoft.ML.Transforms;
 using Microsoft.ML.Transforms.Dnn;
 using NumSharp;
 using Tensorflow;
+using Tensorflow.Keras;
 using Tensorflow.Keras.Utils;
 using Tensorflow.Summaries;
 using static Microsoft.ML.Transforms.Dnn.DnnUtils;
@@ -739,9 +740,9 @@ namespace Microsoft.ML.Transforms
             var moving_ave_decay = Configuration.YOLO_MOVING_AVE_DECAY;
             var max_bbox_per_scale = 150;
             var train_logdir = "./data/log/train";
-            var trainset = Dataset('train');
-            var testset = Dataset('test');
-            var steps_per_period = len(self.trainset);
+            var trainset = Dataset("train");
+            var testset = Dataset("test");
+            var steps_per_period = trainset.Length;
 
             Tensor input_data = null, label_sbbox = null, label_mbbox = null, label_lbbox = null, true_sbboxes = null, true_mbboxes = null, true_lbboxes = null, trainable = null;
             YoloV3 model;
@@ -1889,8 +1890,8 @@ namespace Microsoft.ML.Transforms
         // TRAIN Constants
 
         public const string TRAIN_ANNOT_PATH                  = "./data/dataset/voc_train.txt";
-        public const double TRAIN_BATCH_SIZE                  = 6;
-        public static int[]        TRAIN_INPUT_SIZE                  = new int[] {320, 352, 384, 416, 448, 480, 512, 544, 576, 608};
+        public const int    TRAIN_BATCH_SIZE                  = 6;
+        public static int   TRAIN_INPUT_SIZE                  = 320; // new int[] {320, 352, 384, 416, 448, 480, 512, 544, 576, 608}
         public const bool   TRAIN_DATA_AUG                    = true;
         public const double TRAIN_LEARN_RATE_INIT             = 1e-4;
         public const double TRAIN_LEARN_RATE_END              = 1e-6;
@@ -2072,7 +2073,7 @@ namespace Microsoft.ML.Transforms
         }
 
         // Slices tensor with the specified start and end for each dimension
-        private Tensor slice(Tensor input, int[] start, int[] end)
+        public Tensor slice(Tensor input, int[] start, int[] end)
         {
             Tensor s = new Tensor(start);
             Tensor e = new Tensor(end);
@@ -2083,7 +2084,7 @@ namespace Microsoft.ML.Transforms
         }
 
         // Slices tensor's last dimension at the specified start and end
-        private Tensor slice(Tensor input, int start, int end)
+        public Tensor slice(Tensor input, int start, int end)
         {
             int[] s = new int[input.TensorShape.dims.Length];
             int[] e = new int[input.TensorShape.dims.Length];
@@ -2285,9 +2286,10 @@ namespace Microsoft.ML.Transforms
     internal class Dataset
     {
         string annot_path;
-        int[] input_sizes;
-        double batch_size;
+        int input_sizes;
+        int batch_size;
         bool data_aug;
+
         int[] train_input_sizes;
         NDArray strides;
         string[] classes;
@@ -2296,8 +2298,11 @@ namespace Microsoft.ML.Transforms
         int anchor_per_scale;
         int max_bbox_per_scale;
         int num_samples;
-        int num_batchs;
+        int num_batches;
         int batch_count;
+        string[] annotations;
+        int train_input_size;
+        NDArray train_output_sizes;
 
         public Dataset(string dataset_type)
         {
@@ -2313,7 +2318,7 @@ namespace Microsoft.ML.Transforms
             if (dataset_type == "train") data_aug = Configuration.TRAIN_DATA_AUG;
             else data_aug = Configuration.TEST_DATA_AUG;
 
-            train_input_sizes = Configuration.TRAIN_INPUT_SIZE;
+            train_input_size = Configuration.TRAIN_INPUT_SIZE;
             strides = np.array(Configuration.YOLO_STRIDES);
 
             OD_Utils utils = new OD_Utils();
@@ -2325,8 +2330,116 @@ namespace Microsoft.ML.Transforms
 
             annotations = load_annotations(dataset_type);
             num_samples = annotations.Length;
-            num_batchs = int(np.ceil(num_samples / batch_size));
+            num_batchs = (int)(Math.Ceiling((double)(num_samples / batch_size)));
             batch_count = 0;
+        }
+
+        public string[] load_annotations(string dataset_type)
+        {
+            int i = 0;
+            string[] annotations = new string[] { };
+            foreach (string line in File.ReadLines(annot_path, Encoding.UTF8))
+            {
+                if (strip(line).Split(new char[] { ' ' }).Length != 0) annotations[i] = strip(line);
+                i++;
+            }
+            return annotations;
+        }
+
+        // Removes leading spaces
+        public string strip(string s)
+        {
+            return s.Substring(s.LastIndexOf(' ') + 1);
+        }
+
+        public (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor) next()
+        {
+            tf_with(tf.variable_scope("/cpu: 0"), delegate
+            {
+                train_input_size = RandomChoice(train_input_sizes);
+                train_output_sizes = np.divide(train_input_size, strides);
+
+                var batch_image = np.zeros(new int[] {batch_size, train_input_size, train_input_size, 3 });
+
+                var batch_label_sbbox = np.zeros(new int[] {batch_size, train_output_sizes[0], train_output_sizes[0],
+                                              anchor_per_scale, 5 + num_classes});
+                var batch_label_mbbox = np.zeros(new int[] {batch_size, train_output_sizes[1], train_output_sizes[1],
+                                              anchor_per_scale, 5 + num_classes });
+                var batch_label_lbbox = np.zeros(new int[] {batch_size, train_output_sizes[2], train_output_sizes[2],
+                                              anchor_per_scale, 5 + num_classes});
+
+                var batch_sbboxes = np.zeros((batch_size, max_bbox_per_scale, 4));
+                var batch_mbboxes = np.zeros((batch_size, max_bbox_per_scale, 4));
+                var batch_lbboxes = np.zeros((batch_size, max_bbox_per_scale, 4));
+
+                var num = 0;
+                if (batch_count < num_batches)
+                {
+                    while (num < batch_size)
+                    {
+                        var index = batch_count * batch_size + num;
+                        if (index >= num_samples) index -= num_samples;
+                        var annotation = annotations[index];
+                        var image, bboxes = parse_annotation(annotation);
+                        Tensor label_sbbox, label_mbbox, label_lbbox, sbboxes, mbboxes, lbboxes = preprocess_true_boxes(bboxes);
+
+                        batch_image[num, :, :, :] = image;
+                        batch_label_sbbox[num, :, :, :, :] = label_sbbox;
+                        batch_label_mbbox[num, :, :, :, :] = label_mbbox;
+                        batch_label_lbbox[num, :, :, :, :] = label_lbbox;
+                        batch_sbboxes[num, :, :] = sbboxes;
+                        batch_mbboxes[num, :, :] = mbboxes;
+                        batch_lbboxes[num, :, :] = lbboxes;
+                        num++;
+                    }
+                    batch_count++;
+                    return (batch_image, batch_label_sbbox, batch_label_mbbox, batch_label_lbbox,
+                        batch_sbboxes, batch_mbboxes, batch_lbboxes);
+                } else
+                {
+                    batch_count = 0;
+                    np.random.shuffle(annotations);
+                }
+                return (batch_image, batch_label_sbbox, batch_label_mbbox, batch_label_lbbox,
+                        batch_sbboxes, batch_mbboxes, batch_lbboxes);
+            });
+        }
+
+        // Divide each value of integer array by specified integer and return array
+        public int[] divideArray<T>(int[] arr, int denominator)
+        {
+            for (int i = 0; i < arr.Length; i++)
+            {
+                arr[i] = (int)Math.Floor((double)(arr[i] / denominator));
+            }
+            return arr;
+        }
+
+        public (Tensor, Tensor) random_crop(Tensor image, Tensor bboxes)
+        {
+            var w = image.TensorShape;
+            YoloV3 yolo = new YoloV3(image, false);
+            List<Tensor> values = new List<Tensor>();
+            values.Add(tf.min(yolo.slice(bboxes, 0, 2), axis: 0));
+            values.Add(tf.max(yolo.slice(bboxes, 2, 4), axis: 0));
+            var max_bbox = tf.concat(values, axis: -1);
+        }
+
+        // Selects random value from an enumerable
+        public T RandomChoice<T>(IEnumerable<T> source)
+        {
+            Random rnd = new Random();
+            T result = default(T);
+            int cnt = 0;
+            foreach (T item in source)
+            {
+                cnt++;
+                if (rnd.Next(cnt) == 0)
+                {
+                    result = item;
+                }
+            }
+            return result;
         }
     }
 
