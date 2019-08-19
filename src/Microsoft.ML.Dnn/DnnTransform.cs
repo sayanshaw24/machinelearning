@@ -740,9 +740,10 @@ namespace Microsoft.ML.Transforms
             var moving_ave_decay = Configuration.YOLO_MOVING_AVE_DECAY;
             var max_bbox_per_scale = 150;
             var train_logdir = "./data/log/train";
-            var trainset = Dataset("train");
-            var testset = Dataset("test");
-            var steps_per_period = trainset.Length;
+            var trainset = new Dataset("train");
+            var testset = new Dataset("test");
+            var steps_per_period = trainset.length();
+            Tensor learn_rate;
 
             Tensor input_data = null, label_sbbox = null, label_mbbox = null, label_lbbox = null, true_sbboxes = null, true_mbboxes = null, true_lbboxes = null, trainable = null;
             YoloV3 model;
@@ -777,6 +778,20 @@ namespace Microsoft.ML.Transforms
                                         dtype: tf.float64, name: "warmup_steps");
                 var train_steps = tf.constant((first_stage_epochs + second_stage_epochs) * steps_per_period,
                                         dtype: tf.float64, name: "train_steps");
+                learn_rate = ((bool)(global_step < warmup_steps)) ? (global_step / warmup_steps * learn_rate_init) : 
+                    learn_rate_end + 0.5 * (learn_rate_init - learn_rate_end) * (1 + tf.cos(
+                    (global_step - warmup_steps) / (train_steps - warmup_steps) * Math.PI));
+                global_step_update = tf.assign_add(global_step, 1.0);
+            });
+
+            tf_with(tf.name_scope("define_weight_decay"), scope =>
+            {
+                moving_ave = tf.train.ExponentialMovingAverage(moving_ave_decay).apply(tf.trainable_variables());
+            });
+
+            tf_with(tf.name_scope("define_first_stage_train"), scope =>
+            {
+                var first_stage_trainable_var_list = new string[] { };
             });
 
             var (batch_size, bottleneck_tensor_size) = (bottleneckTensor.TensorShape.Dimensions[0], bottleneckTensor.TensorShape.Dimensions[1]);
@@ -2280,6 +2295,38 @@ namespace Microsoft.ML.Transforms
             string anchors = File.ReadAllText(anchors_path, Encoding.UTF8);
             return np.array(anchors.Split(','), dtype: np.float32).reshape(new int[] { 3, 3, 2 });
         }
+
+        public (Tensor, Tensor) image_preprocess(Tensor image, int[] target_size, Tensor gt_boxes = null)
+        {
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB).astype(np.float32);
+
+            var ih = target_size[0];
+            var iw = target_size[1];
+            var h = image.shape[0];
+            var w = image.shape[1];
+            var _ = image.shape[2];
+
+            var scale = Math.Min(iw / w, ih / h);
+            var nw = scale * w;
+            var nh = scale * h;
+            var image_resized = cv2.resize(image, (nw, nh));
+
+            var image_paded = np.full(shape: new int[] { ih, iw, 3 }, fill_value: 128.0);
+            var dw = Math.Floor((decimal)((iw - nw) / 2));
+            var dh = Math.Floor((decimal)((ih - nh) / 2));
+            image_paded[dh: nh + dh, dw: nw + dw, :] = image_resized;
+            image_paded = image_paded / 255;
+
+            if (gt_boxes == null)
+            {
+                return image_paded;
+            } else
+            {
+                gt_boxes[:, [0, 2]] = gt_boxes[:, [0, 2]] * scale + dw;
+                gt_boxes[:, [1, 3]] = gt_boxes[:, [1, 3]] * scale + dh;
+                return (image_paded, gt_boxes);
+            }
+         }
     }
 
     // OD Change: Dataset processing
@@ -2312,7 +2359,7 @@ namespace Microsoft.ML.Transforms
             if (dataset_type == "train") input_sizes = Configuration.TRAIN_INPUT_SIZE;
             else input_sizes = Configuration.TEST_INPUT_SIZE;
 
-            if (dataset_type == "train")  batch_size = Configuration.TRAIN_BATCH_SIZE;
+            if (dataset_type == "train") batch_size = Configuration.TRAIN_BATCH_SIZE;
             else batch_size = Configuration.TEST_BATCH_SIZE;
 
             if (dataset_type == "train") data_aug = Configuration.TRAIN_DATA_AUG;
@@ -2330,7 +2377,7 @@ namespace Microsoft.ML.Transforms
 
             annotations = load_annotations(dataset_type);
             num_samples = annotations.Length;
-            num_batchs = (int)(Math.Ceiling((double)(num_samples / batch_size)));
+            num_batches = (int)(Math.Ceiling((double)(num_samples / batch_size)));
             batch_count = 0;
         }
 
@@ -2359,7 +2406,7 @@ namespace Microsoft.ML.Transforms
                 train_input_size = RandomChoice(train_input_sizes);
                 train_output_sizes = np.divide(train_input_size, strides);
 
-                var batch_image = np.zeros(new int[] {batch_size, train_input_size, train_input_size, 3 });
+                var batch_image = np.zeros(new int[] { batch_size, train_input_size, train_input_size, 3 });
 
                 var batch_label_sbbox = np.zeros(new int[] {batch_size, train_output_sizes[0], train_output_sizes[0],
                                               anchor_per_scale, 5 + num_classes});
@@ -2380,8 +2427,10 @@ namespace Microsoft.ML.Transforms
                         var index = batch_count * batch_size + num;
                         if (index >= num_samples) index -= num_samples;
                         var annotation = annotations[index];
-                        var image, bboxes = parse_annotation(annotation);
-                        Tensor label_sbbox, label_mbbox, label_lbbox, sbboxes, mbboxes, lbboxes = preprocess_true_boxes(bboxes);
+                        NDArray image, bboxes;
+                        (image, bboxes) = parse_annotation(annotation);
+                        Tensor label_sbbox, label_mbbox, label_lbbox, sbboxes, mbboxes, lbboxes;
+                        (label_sbbox, label_mbbox, label_lbbox, sbboxes, mbboxes, lbboxes) = preprocess_true_boxes(bboxes);
 
                         batch_image[num, :, :, :] = image;
                         batch_label_sbbox[num, :, :, :, :] = label_sbbox;
@@ -2403,6 +2452,7 @@ namespace Microsoft.ML.Transforms
                 return (batch_image, batch_label_sbbox, batch_label_mbbox, batch_label_lbbox,
                         batch_sbboxes, batch_mbboxes, batch_lbboxes);
             });
+            return (null, null, null, null, null, null, null);
         }
 
         // Divide each value of integer array by specified integer and return array
@@ -2415,14 +2465,63 @@ namespace Microsoft.ML.Transforms
             return arr;
         }
 
-        public (Tensor, Tensor) random_crop(Tensor image, Tensor bboxes)
+        public (NDArray, NDArray) random_horizontal_flip(NDArray image, NDArray bboxes)
         {
-            var w = image.TensorShape;
-            YoloV3 yolo = new YoloV3(image, false);
-            List<Tensor> values = new List<Tensor>();
-            values.Add(tf.min(yolo.slice(bboxes, 0, 2), axis: 0));
-            values.Add(tf.max(yolo.slice(bboxes, 2, 4), axis: 0));
-            var max_bbox = tf.concat(values, axis: -1);
+            Random rand = new Random();
+            double d = rand.Next();
+            if (d < 0.5)
+            {
+                int h = image.shape[0];
+                int w = image.shape[0];
+                int _ = image.shape[0];
+                image = image[:, ::- 1, :];
+                bboxes[:, [0, 2]] = w - bboxes[:, [2, 0]];
+            }
+            return (image, bboxes);
+        }
+
+        public (NDArray, NDArray) random_crop(NDArray image, NDArray bboxes)
+        {
+            Random rand = new Random();
+            double d = rand.Next();
+            if (d < 0.5)
+            {
+                int h = image.shape[0];
+                int w = image.shape[1];
+                int _ = image.shape[2];
+                var max_bbox = np.concatenate(new NDArray[][] { null, null }, axis: -1);
+                // replace 2D array with new NDArray[][] {np.min(bboxes[:, 0:2], axis: 0), np.max(bboxes[:, 2:4], axis: 0)}
+
+                var max_l_trans = max_bbox[0];
+                var max_u_trans = max_bbox[1];
+                var max_r_trans = w - max_bbox[2];
+                var max_d_trans = h - max_bbox[3];
+
+                var crop_xmin = max(0, max_bbox[0] - RandomNumber(0, max_l_trans));
+                var crop_ymin = max(0, max_bbox[1] - RandomNumber(0, max_u_trans));
+                var crop_xmax = max(w, max_bbox[2] + RandomNumber(0, max_r_trans));
+                var crop_ymax = max(h, max_bbox[3] + RandomNumber(0, max_d_trans));
+
+                image = image[crop_ymin: crop_ymax, crop_xmin: crop_xmax];
+
+                bboxes[:, [0, 2]] = bboxes[:, [0, 2]] - crop_xmin;
+                bboxes[:, [1, 3]] = bboxes[:, [1, 3]] - crop_ymin;
+            }
+            return (image, bboxes);
+        }
+
+        // Generate a random number between two numbers
+        public int RandomNumber(int min, int max)
+        {
+            Random random = new Random();
+            return random.Next(min, max);
+        }
+
+        // Returns maximum between two integers
+        public int max(int x, int y)
+        {
+            if (x > y) return x;
+            else return y;
         }
 
         // Selects random value from an enumerable
@@ -2440,6 +2539,178 @@ namespace Microsoft.ML.Transforms
                 }
             }
             return result;
+        }
+
+        public (NDArray, NDArray) random_translate(NDArray image, NDArray bboxes)
+        {
+            Random rand = new Random();
+            double d = rand.Next();
+            if (d < 0.5)
+            {
+                int h = image.shape[0];
+                int w = image.shape[1];
+                int _ = image.shape[2];
+                var max_bbox = np.concatenate(new NDArray[][] { null, null }, axis: -1);
+                // replace 2D array with new NDArray[][] {np.min(bboxes[:, 0:2], axis: 0), np.max(bboxes[:, 2:4], axis: 0)}
+
+                var max_l_trans = max_bbox[0];
+                var max_u_trans = max_bbox[1];
+                var max_r_trans = w - max_bbox[2];
+                var max_d_trans = h - max_bbox[3];
+
+                var tx = np.random.uniform(-(max_l_trans - 1), (max_r_trans - 1));
+                var ty = np.random.uniform(-(max_u_trans - 1), (max_d_trans - 1));
+
+                var M = np.array(new int[][]{ new int[] { 1, 0, (int)tx}, new int[] {0, 1, (int)ty}});
+                image = cv2.warpAffine(image, M, new int[]{w, h});
+                
+                bboxes[:,[0, 2]] = bboxes[:,[0, 2]] + tx;
+                bboxes[:,[1, 3]] = bboxes[:,[1, 3]] + ty;
+            }
+            return (image, bboxes);
+        }
+
+        public (NDArray, NDArray) parse_annotation(string annotation)
+        {
+            var line = annotation.Split();
+            var image_path = line[0];
+
+            if (!File.Exists(image_path) && !Directory.Exists(image_path))
+            {
+                Console.WriteLine("{0} is not a valid file or directory.", image_path);
+            }
+
+            var image = np.array(cv2.imread(image_path));
+            NDArray bboxes;
+            for (int i = 1; i < line.Length; i++)
+            {
+                bboxes = np.array(line[i].Split(new char[] {','}));
+            }
+            // Replaced:
+            // var bboxes = np.array([list(map(int, box.split(','))) for box in line[1:]]);
+
+            if (data_aug)
+            {
+                (image, bboxes) = random_horizontal_flip(np.copy(image), np.copy(bboxes));
+                (image, bboxes) = random_crop(np.copy(image), np.copy(bboxes));
+                (image, bboxes) = random_translate(np.copy(image), np.copy(bboxes));
+            }
+
+            image, bboxes = OD_Utils.image_preprocess(np.copy(image), new int[] { train_input_size, train_input_size}, np.copy(bboxes));
+            return (image, bboxes);
+        }
+
+        public float bbox_iou(NDArray boxes1, NDArray boxes2)
+        {
+            boxes1 = np.array(boxes1);
+            boxes2 = np.array(boxes2);
+
+            var boxes1_area = boxes1[..., 2] * boxes1[..., 3];
+            var boxes2_area = boxes2[..., 2] * boxes2[..., 3];
+
+            boxes1 = np.concatenate([boxes1[..., :2] - boxes1[..., 2:] * 0.5,
+                                    boxes1[..., :2] + boxes1[..., 2:] * 0.5], axis: -1);
+            boxes2 = np.concatenate([boxes2[..., :2] - boxes2[..., 2:] * 0.5,
+                                    boxes2[..., :2] + boxes2[..., 2:] * 0.5], axis: -1);
+
+            var left_up = np.maximum(boxes1[..., :2], boxes2[..., :2]);
+            var right_down = np.minimum(boxes1[..., 2:], boxes2[..., 2:]);
+
+            var inter_section = np.maximum(right_down - left_up, 0.0);
+            var inter_area = inter_section[..., 0] * inter_section[..., 1];
+            var union_area = boxes1_area + boxes2_area - inter_area;
+
+            return inter_area / union_area;
+        }
+
+        public (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor) preprocess_true_boxes(NDArray bboxes)
+        {
+            NDArray label, bboxes_xywh;
+            for (int i = 0; i < 3; i++)
+            {
+                label = np.zeros((train_output_sizes[i], train_output_sizes[i], anchor_per_scale,
+                               5 + num_classes));
+                bboxes_xywh = np.zeros((max_bbox_per_scale, 4));
+            }
+            var bbox_count = np.zeros(new int[] { 3, });
+            float iou_scale;
+
+            foreach (Tensor bbox in bboxes)
+            {
+                var bbox_coor = bbox[:4];
+                var bbox_class_ind = bbox[4];
+
+                var onehot = np.zeros(num_classes, dtype: np.float32);
+                onehot[bbox_class_ind] = 1.0;
+                var uniform_distribution = np.full(num_classes, 1.0 / num_classes);
+                var deta = 0.01;
+                var smooth_onehot = onehot * (1 - deta) + deta * uniform_distribution;
+
+                var bbox_xywh = np.concatenate([(bbox_coor[2:] + bbox_coor[:2]) * 0.5, bbox_coor[2:] - bbox_coor[:2]], axis: -1);
+                var bbox_xywh_scaled = 1.0 * bbox_xywh[np.newaxis, :] / strides[:, np.newaxis];
+
+                var iou = new float[1];
+                var exist_positive = false;
+                int xind;
+                int yind;
+                for (int i = 0; i < 3; i++)
+                {
+                    var anchors_xywh = np.zeros((anchor_per_scale, 4));
+                    anchors_xywh[:, 0:2] = Math.Floor(bbox_xywh_scaled[i, 0:2]).astype(np.int32) + 0.5;
+                    anchors_xywh[:, 2:4] = anchors[i];
+
+                    iou_scale = bbox_iou(bbox_xywh_scaled[i][np.newaxis, :], anchors_xywh);
+                    iou[0] = (iou_scale);
+                    var iou_mask = iou_scale > 0.3;
+
+                    if (iou_mask) {
+                        xind = Math.Floor(bbox_xywh_scaled[i, 0:2]);
+                        yind = Math.Floor(bbox_xywh_scaled[i, 0:2]);
+
+                        label[i][yind, xind, iou_mask, :] = 0;
+                        label[i][yind, xind, iou_mask, 0:4] = bbox_xywh;
+                        label[i][yind, xind, iou_mask, 4:5] = 1.0;
+                        label[i][yind, xind, iou_mask, 5:] = smooth_onehot;
+
+                        var bbox_ind = (int)(bbox_count[i] % max_bbox_per_scale);
+                        bboxes_xywh[i][bbox_ind, :4] = bbox_xywh;
+                        bbox_count[i] += 1;
+
+                        exist_positive = true;
+                    }
+                }
+
+                if (!exist_positive)
+                {
+                    var best_anchor_ind = np.argmax(np.array(iou).reshape(-1), axis: -1);
+                    var best_detect = (int)(best_anchor_ind / anchor_per_scale);
+                    var best_anchor = (int)(best_anchor_ind % anchor_per_scale);
+                    xind = (int)Math.Floor(bbox_xywh_scaled[best_detect, 0:2]);
+                    yind = (int)Math.Floor(bbox_xywh_scaled[best_detect, 0:2]);
+
+                    label[best_detect][yind, xind, best_anchor, :] = 0;
+                    label[best_detect][yind, xind, best_anchor, 0:4] = bbox_xywh;
+                    label[best_detect][yind, xind, best_anchor, 4:5] = 1.0;
+                    label[best_detect][yind, xind, best_anchor, 5:] = smooth_onehot;
+
+                    var bbox_ind = (int)(bbox_count[best_detect] % max_bbox_per_scale);
+                    bboxes_xywh[best_detect][bbox_ind, :4] = bbox_xywh;
+                    bbox_count[best_detect] += 1;
+                }
+            }
+            Tensor label_sbbox = new Tensor(label[0]);
+            Tensor label_mbbox = new Tensor(label[1]);
+            Tensor label_lbbox = new Tensor(label[2]);
+
+            Tensor sbboxes = new Tensor(bboxes_xywh[0]);
+            Tensor mbboxes = new Tensor(bboxes_xywh[1]);
+            Tensor lbboxes = new Tensor(bboxes_xywh[2]);
+            return (label_sbbox, label_mbbox, label_lbbox, sbboxes, mbboxes, lbboxes);
+        }
+
+        public int length()
+        {
+            return num_batches;
         }
     }
 
