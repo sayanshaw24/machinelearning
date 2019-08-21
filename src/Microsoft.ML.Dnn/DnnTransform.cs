@@ -29,6 +29,7 @@ using Emgu.CV;
 using Emgu.Util;
 using Emgu.CV.Structure;
 using Emgu.CV.CvEnum;
+using NumSharp.Backends;
 
 [assembly: LoadableClass(DnnTransformer.Summary, typeof(IDataTransform), typeof(DnnTransformer),
     typeof(DnnEstimator.Options), typeof(SignatureDataTransform), DnnTransformer.UserName, DnnTransformer.ShortName)]
@@ -2553,10 +2554,11 @@ namespace Microsoft.ML.Transforms
                 var ty = np.random.uniform(-(max_u_trans - 1), (max_d_trans - 1));
 
                 var M = np.array(new int[][]{ new int[] { 1, 0, (int)tx}, new int[] {0, 1, (int)ty}});
-                image = cv2.warpAffine(image, M, new int[]{w, h});
-                
-                bboxes[:,[0, 2]] = bboxes[:,[0, 2]] + tx;
-                bboxes[:,[1, 3]] = bboxes[:,[1, 3]] + ty;
+                int[] dimen = new int[] { w, h };
+                CvInvoke.cvWarpAffine(new Tensor(M), new Tensor(image), new Tensor(dimen), 0, new MCvScalar(0));
+
+                bboxes = sliceNDArray(bboxes, 1, 0, 2) + tx;
+                bboxes = sliceNDArray(bboxes, 1, 1, 3) + ty;
             }
             return (image, bboxes);
         }
@@ -2591,24 +2593,46 @@ namespace Microsoft.ML.Transforms
             return (image, bboxes);
         }
 
+        public NDArray sliceNDArray(NDArray arr, int dimension, int start, int end)
+        {
+            Slice[] slices = new Slice[arr.len];
+            for (int i = 0; i < arr.len; i++)
+            {
+                if (i == dimension)
+                {
+                    Slice slice = new Slice(start, end);
+                    slices[i] = slice;
+                } else
+                {
+                    Slice slice = new Slice(0, arr[i].len - 1);
+                    slices[i] = slice;
+                }
+            }
+            return new NDArray(slices);
+        }
+
         public float bbox_iou(NDArray boxes1, NDArray boxes2)
         {
             boxes1 = np.array(boxes1);
             boxes2 = np.array(boxes2);
 
-            var boxes1_area = boxes1[..., 2] * boxes1[..., 3];
-            var boxes2_area = boxes2[..., 2] * boxes2[..., 3];
+            var boxes1_area = sliceNDArray(boxes1, 1, 2, 2) * sliceNDArray(boxes1, 1, 3, 3);
+            var boxes2_area = sliceNDArray(boxes1, 1, 2, 2) * sliceNDArray(boxes1, 1, 3, 3);
 
-            boxes1 = np.concatenate([boxes1[..., :2] - boxes1[..., 2:] * 0.5,
-                                    boxes1[..., :2] + boxes1[..., 2:] * 0.5], axis: -1);
-            boxes2 = np.concatenate([boxes2[..., :2] - boxes2[..., 2:] * 0.5,
-                                    boxes2[..., :2] + boxes2[..., 2:] * 0.5], axis: -1);
 
-            var left_up = np.maximum(boxes1[..., :2], boxes2[..., :2]);
-            var right_down = np.minimum(boxes1[..., 2:], boxes2[..., 2:]);
+            NDArray arr1 = sliceNDArray(boxes1, 1, 0, 2) - sliceNDArray(boxes1, 1, 2, boxes1[1].len - 1) * 0.5;
+            NDArray arr2 = sliceNDArray(boxes1, 1, 0, 2) + sliceNDArray(boxes1, 1, 2, boxes1[1].len - 1) * 0.5;
+            boxes1 = np.concatenate(arrays: new NDArray[] {arr1, arr2}, axis: -1);
 
-            var inter_section = np.maximum(right_down - left_up, 0.0);
-            var inter_area = inter_section[..., 0] * inter_section[..., 1];
+            NDArray arr3 = sliceNDArray(boxes2, 1, 0, 2) - sliceNDArray(boxes2, 1, 2, boxes2[1].len - 1) * 0.5;
+            NDArray arr4 = sliceNDArray(boxes2, 1, 0, 2) + sliceNDArray(boxes2, 1, 2, boxes2[1].len - 1) * 0.5;
+            boxes2 = np.concatenate(arrays: new NDArray[] { arr3, arr4 }, axis: -1);
+
+            var left_up = np.max(sliceNDArray(boxes1, 1, 0, 2), sliceNDArray(boxes2, 1, 0, 2));
+            var right_down = np.minimum(sliceNDArray(boxes1, 1, 2, boxes1[1].len - 1), sliceNDArray(boxes2, 1, 2, boxes1[1].len - 1));
+
+            var inter_section = np.max(right_down - left_up, 0.0);
+            var inter_area = sliceNDArray(inter_section, 1, 0, 0) * sliceNDArray(inter_section, 1, 1, 1);
             var union_area = boxes1_area + boxes2_area - inter_area;
 
             return inter_area / union_area;
