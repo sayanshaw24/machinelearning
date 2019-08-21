@@ -25,6 +25,10 @@ using Tensorflow.Summaries;
 using static Microsoft.ML.Transforms.Dnn.DnnUtils;
 using static Microsoft.ML.Transforms.DnnEstimator;
 using static Tensorflow.Python;
+using Emgu.CV;
+using Emgu.Util;
+using Emgu.CV.Structure;
+using Emgu.CV.CvEnum;
 
 [assembly: LoadableClass(DnnTransformer.Summary, typeof(IDataTransform), typeof(DnnTransformer),
     typeof(DnnEstimator.Options), typeof(SignatureDataTransform), DnnTransformer.UserName, DnnTransformer.ShortName)]
@@ -743,12 +747,14 @@ namespace Microsoft.ML.Transforms
             var trainset = new Dataset("train");
             var testset = new Dataset("test");
             var steps_per_period = trainset.length();
-            Tensor learn_rate;
+            float learn_rate = 0; // for unassigned value error
+            Operation moving_ave;
+            Operation global_step_update;
 
             Tensor input_data = null, label_sbbox = null, label_mbbox = null, label_lbbox = null, true_sbboxes = null, true_mbboxes = null, true_lbboxes = null, trainable = null;
             YoloV3 model;
             VariableV1[] net_var;
-            Tensor giou_loss, conf_loss, prob_loss, loss;
+            Tensor giou_loss, conf_loss, prob_loss, loss = null; // for unassigned value error
             RefVariable global_step;
 
             tf_with(tf.name_scope("define_input"), scope =>
@@ -778,9 +784,9 @@ namespace Microsoft.ML.Transforms
                                         dtype: tf.float64, name: "warmup_steps");
                 var train_steps = tf.constant((first_stage_epochs + second_stage_epochs) * steps_per_period,
                                         dtype: tf.float64, name: "train_steps");
-                learn_rate = ((bool)(global_step < warmup_steps)) ? (global_step / warmup_steps * learn_rate_init) : 
+                learn_rate = (float)(((bool)(global_step < warmup_steps)) ? (global_step / warmup_steps * learn_rate_init) : 
                     learn_rate_end + 0.5 * (learn_rate_init - learn_rate_end) * (1 + tf.cos(
-                    (global_step - warmup_steps) / (train_steps - warmup_steps) * Math.PI));
+                    (global_step - warmup_steps) / (train_steps - warmup_steps) * Math.PI)));
                 global_step_update = tf.assign_add(global_step, 1.0);
             });
 
@@ -791,64 +797,48 @@ namespace Microsoft.ML.Transforms
 
             tf_with(tf.name_scope("define_first_stage_train"), scope =>
             {
-                var first_stage_trainable_var_list = new string[] { };
-            });
-
-            var (batch_size, bottleneck_tensor_size) = (bottleneckTensor.TensorShape.Dimensions[0], bottleneckTensor.TensorShape.Dimensions[1]);
-            tf_with(tf.name_scope("input"), scope =>
-            {
-                _labelTensor = tf.placeholder(tf.int64, new TensorShape(batch_size), name: labelColumn);
-            });
-
-            string layerName = "final_retrain_ops";
-            Tensor logits = null;
-            tf_with(tf.name_scope(layerName), scope =>
-            {
-                RefVariable layerWeights = null;
-                tf_with(tf.name_scope("weights"), delegate
+                var first_stage_trainable_var_list = new List<Tensorflow.RefVariable>();
+                foreach (RefVariable variable in tf.trainable_variables())
                 {
-                    var initialValue = tf.truncated_normal(new int[] { bottleneck_tensor_size, classCount }, stddev: 0.001f);
-                    layerWeights = tf.Variable(initialValue, name: "final_weights");
-                    VariableSummaries(layerWeights);
-                });
-
-                RefVariable layerBiases = null;
-                tf_with(tf.name_scope("biases"), delegate
+                    var var_name = variable.op.name;
+                    var var_name_mess = var_name.ToString().Split(new char[] {'/'});
+                    string[] stringArray = { "conv_sbbox", "conv_mbbox", "conv_lbbox" };
+                    foreach (string x in stringArray)
+                    {
+                        if (var_name_mess[0].Contains(x)) first_stage_trainable_var_list.Add(variable);
+                    }
+                }
+                var first_stage_optimizer = tf.train.AdamOptimizer(learn_rate).minimize(loss,
+                                                      var_list: first_stage_trainable_var_list);
+                tf_with(tf.control_dependencies(tf.get_collection(tf.GraphKeys.UPDATE_OPS)), scope2 =>
                 {
-                    layerBiases = tf.Variable(tf.zeros(classCount), name: "final_biases");
-                    VariableSummaries(layerBiases);
-                });
-
-                tf_with(tf.name_scope("Wx_plus_b"), delegate
-                {
-                    var matmul = tf.matmul(bottleneckTensor, layerWeights);
-                    logits = matmul + layerBiases;
-                    tf.summary.histogram("pre_activations", logits);
+                    tf_with(tf.control_dependencies(new Operation[] {first_stage_optimizer, global_step_update}), scope3 =>
+                    {
+                        tf_with(tf.control_dependencies(new Operation[] {moving_ave}), scope4 =>
+                        {
+                            train_op_with_frozen_variables = tf.no_op();
+                        });
+                    });
                 });
             });
 
-            _softMaxTensor = tf.nn.softmax(logits, name: scoreColumnName);
-
-            tf.summary.histogram("activations", _softMaxTensor);
-            if (!isTraining)
-                return (null, null, _labelTensor, _softMaxTensor);
-
-            Tensor crossEntropyMean = null;
-            tf_with(tf.name_scope("cross_entropy"), delegate
+            tf_with(tf.name_scope("define_second_stage_train"), scope =>
             {
-                crossEntropyMean = tf.losses.sparse_softmax_cross_entropy(
-                    labels: _labelTensor, logits: logits);
+                var second_stage_trainable_var_list = new List<Tensorflow.RefVariable>();
+                var second_stage_optimizer = tf.train.AdamOptimizer(learn_rate).minimize(loss,
+                                                      var_list: second_stage_trainable_var_list);
+                tf_with(tf.control_dependencies(tf.get_collection(tf.GraphKeys.UPDATE_OPS)), scope2 =>
+                {
+                    tf_with(tf.control_dependencies(new Operation[] { second_stage_optimizer, global_step_update }), scope3 =>
+                    {
+                        tf_with(tf.control_dependencies(new Operation[] { moving_ave }), scope4 =>
+                        {
+                            train_op_with_frozen_variables = tf.no_op();
+                        });
+                    });
+                });
             });
-
-            tf.summary.scalar("cross_entropy", crossEntropyMean);
-
-            tf_with(tf.name_scope("train"), delegate
-            {
-                var optimizer = tf.train.AdamOptimizer(learningRate);
-                _trainStep = optimizer.minimize(crossEntropyMean);
-            });
-
-            return (_trainStep, crossEntropyMean, _labelTensor, _softMaxTensor);
+            return (second_stage_optimizer, loss, _labelTensor, _softMaxTensor);
         }
 
         private (Operation, Tensor, Tensor, Tensor) AddFinalRetrainOps(int classCount, string labelColumn,
@@ -2296,9 +2286,10 @@ namespace Microsoft.ML.Transforms
             return np.array(anchors.Split(','), dtype: np.float32).reshape(new int[] { 3, 3, 2 });
         }
 
-        public (Tensor, Tensor) image_preprocess(Tensor image, int[] target_size, Tensor gt_boxes = null)
+        public (Tensor, Tensor) image_preprocess(Tensor imageInput, int[] target_size, Tensor gt_boxes = null)
         {
-            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB).astype(np.float32);
+            Tensor image = new Tensor(new IntPtr());
+            CvInvoke.cvCvtColor(imageInput, image, code: COLOR_CONVERSION.CV_BGR2RGB);
 
             var ih = target_size[0];
             var iw = target_size[1];
@@ -2309,7 +2300,7 @@ namespace Microsoft.ML.Transforms
             var scale = Math.Min(iw / w, ih / h);
             var nw = scale * w;
             var nh = scale * h;
-            var image_resized = cv2.resize(image, (nw, nh));
+            var image_resized = tf.reshape(image, new Tensor(new int[] { nw, nh }));
 
             var image_paded = np.full(shape: new int[] { ih, iw, 3 }, fill_value: 128.0);
             var dw = Math.Floor((decimal)((iw - nw) / 2));
@@ -2580,7 +2571,7 @@ namespace Microsoft.ML.Transforms
                 Console.WriteLine("{0} is not a valid file or directory.", image_path);
             }
 
-            var image = np.array(cv2.imread(image_path));
+            var image = np.array(CvInvoke.cvLoadImage(image_path, LOAD_IMAGE_TYPE.CV_LOAD_IMAGE_ANYCOLOR));
             NDArray bboxes;
             for (int i = 1; i < line.Length; i++)
             {
