@@ -31,5 +31,17 @@
   <ItemGroup>
     <Folder Include="Properties\" />
   </ItemGroup>
+
+  <ItemGroup>
+    <Reference Include="Emgu.CV">
+      <HintPath>..\..\bin\AnyCPU.Debug\Emgu.CV.dll</HintPath>
+    </Reference>
+    <Reference Include="Emgu.CV.UI">
+      <HintPath>..\..\bin\AnyCPU.Debug\Emgu.CV.UI.dll</HintPath>
+    </Reference>
+    <Reference Include="Emgu.Util">
+      <HintPath>..\..\bin\AnyCPU.Debug\Emgu.Util.dll</HintPath>
+    </Reference>
+  </ItemGroup>
   
 </Project>

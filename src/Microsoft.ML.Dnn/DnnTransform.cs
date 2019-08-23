@@ -2496,8 +2496,8 @@ namespace Microsoft.ML.Transforms
 
                 image = image[crop_ymin: crop_ymax, crop_xmin: crop_xmax];
 
-                bboxes[:, [0, 2]] = bboxes[:, [0, 2]] - crop_xmin;
-                bboxes[:, [1, 3]] = bboxes[:, [1, 3]] - crop_ymin;
+                bboxes = sliceNDArray(bboxes, 1, 0, 2) - crop_xmin;
+                bboxes = sliceNDArray(bboxes, 1, 1, 3) - crop_ymin;
             }
             return (image, bboxes);
         }
@@ -2555,7 +2555,7 @@ namespace Microsoft.ML.Transforms
 
                 var M = np.array(new int[][]{ new int[] { 1, 0, (int)tx}, new int[] {0, 1, (int)ty}});
                 int[] dimen = new int[] { w, h };
-                CvInvoke.cvWarpAffine(new Tensor(M), new Tensor(image), new Tensor(dimen), 0, new MCvScalar(0));
+                CvInvoke.cv (new Tensor(M), new Tensor(image), new Tensor(dimen), 0, new MCvScalar(0));
 
                 bboxes = sliceNDArray(bboxes, 1, 0, 2) + tx;
                 bboxes = sliceNDArray(bboxes, 1, 1, 3) + ty;
@@ -2640,7 +2640,7 @@ namespace Microsoft.ML.Transforms
 
         public (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor) preprocess_true_boxes(NDArray bboxes)
         {
-            NDArray label, bboxes_xywh;
+            NDArray label = null, bboxes_xywh = null;
             for (int i = 0; i < 3; i++)
             {
                 label = np.zeros((train_output_sizes[i], train_output_sizes[i], anchor_per_scale,
@@ -2652,16 +2652,16 @@ namespace Microsoft.ML.Transforms
 
             foreach (Tensor bbox in bboxes)
             {
-                var bbox_coor = bbox[:4];
-                var bbox_class_ind = bbox[4];
+                var bbox_coor = bbox.slice(new Slice(0, 4));
+                var bbox_class_ind = bbox.slice(new Slice(4, 4));
 
                 var onehot = np.zeros(num_classes, dtype: np.float32);
-                onehot[bbox_class_ind] = 1.0;
+                onehot[(int)bbox_class_ind] = 1.0;
                 var uniform_distribution = np.full(num_classes, 1.0 / num_classes);
                 var deta = 0.01;
                 var smooth_onehot = onehot * (1 - deta) + deta * uniform_distribution;
 
-                var bbox_xywh = np.concatenate([(bbox_coor[2:] + bbox_coor[:2]) * 0.5, bbox_coor[2:] - bbox_coor[:2]], axis: -1);
+                var bbox_xywh = np.concatenate(new Tensor[] {(bbox_coor.slice(2) + bbox_coor.slice(new Slice(0, 2)) * 0.5, bbox_coor.slice(2) - bbox_coor.slice(new Slice(0, 2))}, axis: -1);
                 var bbox_xywh_scaled = 1.0 * bbox_xywh[np.newaxis, :] / strides[:, np.newaxis];
 
                 var iou = new float[1];
@@ -2676,19 +2676,37 @@ namespace Microsoft.ML.Transforms
 
                     iou_scale = bbox_iou(bbox_xywh_scaled[i][np.newaxis, :], anchors_xywh);
                     iou[0] = (iou_scale);
-                    var iou_mask = iou_scale > 0.3;
+                    var iou_mask_bool = iou_scale > 0.3;
+                    int iou_mask;
 
-                    if (iou_mask) {
+                    if (iou_mask_bool) {
+                        iou_mask = 1;
                         xind = Math.Floor(bbox_xywh_scaled[i, 0:2]);
                         yind = Math.Floor(bbox_xywh_scaled[i, 0:2]);
 
-                        label[i][yind, xind, iou_mask, :] = 0;
-                        label[i][yind, xind, iou_mask, 0:4] = bbox_xywh;
-                        label[i][yind, xind, iou_mask, 4:5] = 1.0;
-                        label[i][yind, xind, iou_mask, 5:] = smooth_onehot;
+                        // Writing to slice for NDArrays
+                        for (int j = 0; j < label[i].shape[3]; j++)
+                        {
+                            label[i][yind, xind, iou_mask, j] = 0;
+                        }
+                        for (int j = 0; j < 5; j++)
+                        {
+                            label[i][yind, xind, iou_mask, j] = bbox_xywh;
+                        }
+                        for (int j = 4; j < 6; j++)
+                        {
+                            label[i][yind, xind, iou_mask, j] = 1.0;
+                        }
+                        for (int j = 5; j < label[i].shape[3]; j++)
+                        {
+                            label[i][yind, xind, iou_mask, j] = smooth_onehot;
+                        }
 
                         var bbox_ind = (int)(bbox_count[i] % max_bbox_per_scale);
-                        bboxes_xywh[i][bbox_ind, :4] = bbox_xywh;
+                        for (int j = 0; j < 5; j++)
+                        {
+                            bboxes_xywh[i][bbox_ind, j] = bbox_xywh;
+                        }
                         bbox_count[i] += 1;
 
                         exist_positive = true;
@@ -2703,13 +2721,29 @@ namespace Microsoft.ML.Transforms
                     xind = (int)Math.Floor(bbox_xywh_scaled[best_detect, 0:2]);
                     yind = (int)Math.Floor(bbox_xywh_scaled[best_detect, 0:2]);
 
-                    label[best_detect][yind, xind, best_anchor, :] = 0;
-                    label[best_detect][yind, xind, best_anchor, 0:4] = bbox_xywh;
-                    label[best_detect][yind, xind, best_anchor, 4:5] = 1.0;
-                    label[best_detect][yind, xind, best_anchor, 5:] = smooth_onehot;
+                    // Writing to slice for NDArrays
+                    for (int j = 0; j < label[best_detect].shape[3]; j++)
+                    {
+                        label[best_detect][yind, xind, best_anchor, j] = 0;
+                    }
+                    for (int j = 0; j < 5; j++)
+                    {
+                        label[best_detect][yind, xind, best_anchor, j] = bbox_xywh;
+                    }
+                    for (int j = 4; j < 6; j++)
+                    {
+                        label[best_detect][yind, xind, best_anchor, j] = 1.0;
+                    }
+                    for (int j = 5; j < label[best_detect].shape[3]; j++)
+                    {
+                        label[best_detect][yind, xind, best_anchor, j] = smooth_onehot;
+                    }
 
                     var bbox_ind = (int)(bbox_count[best_detect] % max_bbox_per_scale);
-                    bboxes_xywh[best_detect][bbox_ind, :4] = bbox_xywh;
+                    for (int j = 0; j < 5; j++)
+                    {
+                        bboxes_xywh[best_detect][bbox_ind, j] = bbox_xywh;
+                    }
                     bbox_count[best_detect] += 1;
                 }
             }
